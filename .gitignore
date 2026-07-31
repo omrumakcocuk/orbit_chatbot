@@ -1,0 +1,19 @@
+# Virtual Environment
+venv/
+
+# Python Cache
+__pycache__/
+*.pyc
+
+# Local Data and Logs
+logs/
+outputs/
+
+# Large Model Files
+voices/
+*.onnx
+*.onnx.json
+
+# Editor Backups
+*.save
+main_yedek.py
