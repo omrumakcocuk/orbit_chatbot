@@ -5,6 +5,8 @@ import time
 import asyncio
 import collections
 import ollama
+import tempfile
+import aiohttp
 
 import numpy as np
 import sounddevice as sd
@@ -28,19 +30,19 @@ WAIT_FOR_SPEECH_TIMEOUT = 10.0
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.3   
 MIN_RECORDING_AFTER_SPEECH_START = 0.3
+MAX_RECORDING_DURATION = 15.0 
 
-# İngilizce Ses Modeli (Piper TTS)
+# İNGİLİZCE MODELLER
 PIPER_MODEL = "voices/en_US-lessac-medium.onnx"
 OLLAMA_MODEL = "gemma4:e2b"
-WHISPER_MODEL_SIZE = "base"
+WHISPER_MODEL_SIZE = "tiny"
 
 LLM_CONTEXT_SIZE = 1024
-LLM_MAX_TOKENS = 70
-LLM_TEMPERATURE = 0.4
+LLM_MAX_TOKENS = 150
+LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 6
 
 perf_metrics = {}
-current_english_level = None  # İngilizce seviye durumu
 conversation_history = []
 
 def reset_metrics():
@@ -60,66 +62,35 @@ def reset_metrics():
 def setup_directories():
     os.makedirs("voices", exist_ok=True)
 
-class PromptBuilder:
-    _sections = None
-
-    @staticmethod
-    def build(level: str) -> str:
-        if PromptBuilder._sections is None:
-            PromptBuilder._sections = {}
-            try:
-                base_dir = os.path.dirname(os.path.abspath(__file__))
-                prompt_file = os.path.join(base_dir, "prompt.txt")
-                with open(prompt_file, "r", encoding="utf-8") as f:
-                    current_section = None
-                    lines_by_section = {}
-                    
-                    for raw_line in f:
-                        line = raw_line.strip()
-                        if not line: continue
-                        
-                        if line.startswith("[") and line.endswith("]"):
-                            current_section = line[1:-1].strip().upper()
-                            lines_by_section[current_section] = []
-                        elif current_section:
-                            lines_by_section[current_section].append(line)
-                            
-                    for sec, lines in lines_by_section.items():
-                        PromptBuilder._sections[sec] = "\n".join(lines)
-            except Exception as e:
-                print(f"Prompt okuma hatası: {e}")
-                
-        base = PromptBuilder._sections.get("BASE", "You are an English tutor.")
-        level_rules = PromptBuilder._sections.get(level.upper(), "")
-        return f"{base}\n\n{level_rules}"
-
-def detect_english_level(recognized_text: str):
-    text = recognized_text.lower()
-    text = re.sub(r'[^\w\s]', '', text)
-    
-    LEVEL_PATTERNS = {
-        "A1": r'\b(a1|a 1|a one|ey one|ey wan|ey van)\b',
-        "A2": r'\b(a2|a 2|a two|ey two|ey tu)\b',
-        "B1": r'\b(b1|b 1|b one|be one|bee one|bi one|bi wan|bi van)\b',
-        "B2": r'\b(b2|b 2|b two|be two|bee two|bi two|bi tu)\b'
-    }
-    
-    for level, pattern in LEVEL_PATTERNS.items():
-        if re.search(pattern, text):
-            return level
-    return None
-
 async def warmup_llm():
-    client = ollama.AsyncClient()
+    url = "http://localhost:11434/api/chat"
+    payload = {
+        "model": OLLAMA_MODEL,
+        "messages": [{"role": "user", "content": "Reply with only: Ready"}],
+        "stream": False,
+        "think": False,
+        "keep_alive": -1,
+        "options": {
+            "num_ctx": LLM_CONTEXT_SIZE,
+            "num_thread": LLM_THREADS,
+            "temperature": 0.0,
+            "num_predict": 10
+        }
+    }
+
     try:
-        await client.chat(
-            model=OLLAMA_MODEL,
-            messages=[{"role": "user", "content": "Hello"}],
-            stream=False,
-            options={"num_ctx": 1024, "num_thread": LLM_THREADS, "temperature": 0.2, "num_predict": 1}
-        )
+        # Modelin ilk yüklenmesi 3 saniyeden uzun sürebildiği için güvenli timeout.
+        timeout = aiohttp.ClientTimeout(total=30.0)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.post(url, json=payload) as response:
+                response.raise_for_status()
+                await response.json()
+
+        print("✅ Ollama warmup completed.")
+
     except Exception as e:
-        print(f"❌ Warmup error: {e}")
+        # Warmup başarısız olsa bile chatbot çalışmaya devam eder.
+        print(f"⚠️ Ollama warmup error: {e}")
 
 def record_audio_sync(fs, channels):
     block_size = int(fs * BLOCK_DURATION)
@@ -135,46 +106,47 @@ def record_audio_sync(fs, channels):
     pre_speech_blocks = collections.deque(maxlen=pre_speech_buffer_size)
     
     try:
-        stream = sd.InputStream(samplerate=fs, channels=channels, dtype='int16', blocksize=block_size)
-        stream.start()
-        
-        while True:
-            current_time = time.perf_counter()
-            elapsed_total = current_time - start_time
+        # with bloğu kullanmak, hata durumunda bile stream'in (mikrofon akışının) kesin kapanmasını sağlar
+        with sd.InputStream(samplerate=fs, channels=channels, dtype='int16', blocksize=block_size) as stream:
             
-            if not speech_started and elapsed_total > WAIT_FOR_SPEECH_TIMEOUT:
-                break
+            while True:
+                current_time = time.perf_counter()
+                elapsed_total = current_time - start_time
                 
-            data, overflowed = stream.read(block_size)
-            rms = np.sqrt(np.mean(np.square(data.astype(np.float32))))
-            if rms > max_rms: max_rms = rms
-                
-            if not speech_started:
-                if rms > SPEECH_THRESHOLD:
-                    consecutive_high_blocks += 1
-                    pre_speech_blocks.append(data)
-                    if consecutive_high_blocks >= START_BLOCK_COUNT:
-                        speech_started = True
-                        first_speech_block_time = current_time
-                        recorded_frames.extend(pre_speech_blocks)
-                        pre_speech_blocks.clear()
-                else:
-                    consecutive_high_blocks = 0
-                    pre_speech_blocks.append(data)
-            else:
-                recorded_frames.append(data)
-                if rms > SPEECH_THRESHOLD:
-                    silence_time = 0.0
-                else:
-                    silence_time += BLOCK_DURATION
+                if not speech_started and elapsed_total > WAIT_FOR_SPEECH_TIMEOUT:
+                    break
                     
-                if (current_time - first_speech_block_time) > MIN_RECORDING_AFTER_SPEECH_START:
-                    if silence_time > SILENCE_DURATION:
-                        break
+                # YENİ: Maksimum kayıt süresini aşarsak zorla kes (RAM şişmesini engeller)
+                if speech_started and (current_time - first_speech_block_time) > MAX_RECORDING_DURATION:
+                    break
                     
-        stream.stop()
-        stream.close()
-        
+                data, overflowed = stream.read(block_size)
+                rms = np.sqrt(np.mean(np.square(data.astype(np.float32))))
+                if rms > max_rms: max_rms = rms
+                    
+                if not speech_started:
+                    if rms > SPEECH_THRESHOLD:
+                        consecutive_high_blocks += 1
+                        pre_speech_blocks.append(data)
+                        if consecutive_high_blocks >= START_BLOCK_COUNT:
+                            speech_started = True
+                            first_speech_block_time = current_time
+                            recorded_frames.extend(pre_speech_blocks)
+                            pre_speech_blocks.clear()
+                    else:
+                        consecutive_high_blocks = 0
+                        pre_speech_blocks.append(data)
+                else:
+                    recorded_frames.append(data)
+                    if rms > SPEECH_THRESHOLD:
+                        silence_time = 0.0
+                    else:
+                        silence_time += BLOCK_DURATION
+                        
+                    if (current_time - first_speech_block_time) > MIN_RECORDING_AFTER_SPEECH_START:
+                        if silence_time > SILENCE_DURATION:
+                            break
+                            
         if not speech_started:
             if (time.perf_counter() - start_time) > WAIT_FOR_SPEECH_TIMEOUT:
                 return "TIMEOUT"
@@ -193,7 +165,7 @@ def record_audio_sync(fs, channels):
 def transcribe_audio_sync(stt_model, audio_data):
     try:
         segments, _ = stt_model.transcribe(
-            audio_data, beam_size=2, language="en",
+            audio_data, beam_size=2, language="en", # İNGİLİZCE
             vad_filter=False, without_timestamps=True,
             condition_on_previous_text=False, temperature=0.0
         )
@@ -202,6 +174,7 @@ def transcribe_audio_sync(stt_model, audio_data):
         text = " ".join(valid_texts).strip()
         
         lower_text = text.lower()
+        # İNGİLİZCE HALÜSİNASYONLAR
         hallucinations = ["thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "amara.org", "bye"]
         for h in hallucinations: lower_text = lower_text.replace(h, "")
         if len(re.sub(r'[^\w\s]', '', lower_text).strip()) <= 1: return ""
@@ -216,6 +189,7 @@ def remove_emojis(text):
 def clean_text_for_tts(text):
     text = remove_emojis(text)
     text = text.replace("\n", " ").strip()
+    # ÖNEMLİ DÜZELTME: İngilizce'deki kesme işaretini (') koruyoruz (I'm, don't bozulmaması için)
     text = re.sub(r'[^\w\s.,!?\']', '', text)  
     return re.sub(r'\s+', ' ', text).strip()
 
@@ -225,6 +199,7 @@ stt_queue = asyncio.Queue()
 llm_queue = asyncio.Queue()
 tts_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
+audio_queue = asyncio.Queue() # YENİ: Hazır ses dosyaları için kuyruk
 can_listen_event = asyncio.Event()
 
 async def vad_worker():
@@ -234,7 +209,7 @@ async def vad_worker():
         await can_listen_event.wait()
         
         if not is_listening_printed:
-            print("\n🎤 Dinleniyor...")
+            print("\n🎤 Listening...")
             is_listening_printed = True
             
         reset_metrics()
@@ -251,7 +226,7 @@ async def vad_worker():
         elif audio_data == "TIMEOUT":
             if consecutive_timeouts == 0:
                 can_listen_event.clear()
-                await tts_queue.put("I haven't heard you for 10 seconds, could you please repeat?")
+                await tts_queue.put("I haven't heard you for a while, could you please repeat?")
                 await tts_queue.put(None)
                 consecutive_timeouts += 1
                 is_listening_printed = False
@@ -279,63 +254,41 @@ async def stt_worker(stt_model):
         stt_queue.task_done()
 
 async def llm_worker():
-    global current_english_level, conversation_history
-    
-    START_QUESTIONS = {
-        "A1": "What is your name?",
-        "A2": "What do you like to do in your free time?",
-        "B1": "Can you tell me about your daily routine?",
-        "B2": "What would you like to talk about today?"
-    }
+    global conversation_history
+    system_prompt = "You are a friendly, natural and helpful English conversation partner. Always reply in English. Keep your answers short and conversational."
     
     client = ollama.AsyncClient()
     
     while True:
         text = await llm_queue.get()
-        print(f"🗣️ Siz: {text}")
+        print(f"🗣️ You: {text}")
         
-        if current_english_level is None:
-            level = detect_english_level(text)
-            if level:
-                current_english_level = level
-                print(f"✅ Level Selected: {level}")
-                
-                response_text = f"Great! Your level is {level}. {START_QUESTIONS[level]}"
-                print(f"🤖 Asistan: {response_text}")
-                
-                conversation_history.append({"role": "assistant", "content": response_text})
-                
-                await tts_queue.put(response_text)
-                await tts_queue.put(None)
-            else:
-                response_text = "I could not understand your level. Please say A1, A2, B1 or B2."
-                print(f"🤖 Asistan: {response_text}")
-                await tts_queue.put(response_text)
-                await tts_queue.put(None)
-            
-            llm_queue.task_done()
-            continue
-            
-        system_prompt = PromptBuilder.build(current_english_level)
-        
-        print("🤖 Asistan: ", end="", flush=True)
+        print("🤖 Assistant: ", end="", flush=True)
         perf_metrics["llm_start"] = time.perf_counter()
-        
-        messages = [{"role": "system", "content": system_prompt}] + conversation_history + [{"role": "user", "content": text}]
         
         full_response = ""
         try:
-            async for chunk in await client.chat(
+            messages = [
+                {"role": "system", "content": system_prompt},
+                *conversation_history,
+                {"role": "user", "content": text}
+            ]
+            
+            response = await client.chat(
                 model=OLLAMA_MODEL,
                 messages=messages,
+                think=False,
                 stream=True,
+                keep_alive=-1,
                 options={
                     "num_ctx": LLM_CONTEXT_SIZE, 
                     "num_thread": LLM_THREADS, 
                     "temperature": LLM_TEMPERATURE,
                     "num_predict": LLM_MAX_TOKENS
                 }
-            ):
+            )
+            
+            async for chunk in response:
                 content = chunk.get("message", {}).get("content", "")
                 if content:
                     if perf_metrics["llm_first_token"] == 0.0:
@@ -343,17 +296,18 @@ async def llm_worker():
                     
                     full_response += content
                     
-                    display_chunk = remove_emojis(content)
+                    clean_chunk = remove_emojis(content)
+                    display_chunk = re.sub(r'[^\w\s\']', '', clean_chunk)
                     print(display_chunk, end="", flush=True)
                     
-                    await tts_queue.put(display_chunk)
-            
+                    await tts_queue.put(clean_chunk)
+                    
             if full_response.strip():
                 conversation_history.append({"role": "user", "content": text})
                 conversation_history.append({"role": "assistant", "content": full_response.strip()})
                 conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
         except Exception as e:
-            print(f"\n❌ LLM Hatası: {e}")
+            print(f"\n❌ LLM Error: {e}")
             
         perf_metrics["llm_end"] = time.perf_counter()
         print() 
@@ -392,63 +346,78 @@ async def tts_chunk_worker():
                 
         tts_queue.task_done()
 
-async def playback_worker():
-    process = None
-    t1 = 0
-    first_audio_sent = False
-    
+# YENİ: Sadece metni Piper'a gönderip sesi geçici bir wav dosyasına kaydeder
+async def tts_generator_worker():
     while True:
         item = await playback_queue.get()
         
         if item is None:
-            if process:
-                process.stdin.close()
-                await process.wait()
-                perf_metrics["tts_total"] += (time.perf_counter() - t1)
-                process = None
+            await audio_queue.put(None)
+        else:
+            sentence = item
+            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+            temp_filepath = temp_file.name
+            temp_file.close()
+
+            try:
+                piper_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.09 --output_file {temp_filepath}"
                 
+                process = await asyncio.create_subprocess_shell(
+                    piper_cmd,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL
+                )
+                
+                process.stdin.write((sentence + "\n").encode('utf-8'))
+                await process.stdin.drain() # EKLEME 2: Buffer tıkanıklığını önler
+                process.stdin.close() 
+                await process.wait() 
+                
+                await audio_queue.put(temp_filepath)
+                
+            except Exception as e:
+                print(f"❌ Piper generation error: {e}")
+                if os.path.exists(temp_filepath):
+                    os.remove(temp_filepath)
+                
+        playback_queue.task_done()
+
+# YENİ: Sadece hazır ses dosyalarını alır ve hiç beklemeden arka arkaya çalar
+async def audio_player_worker():
+    while True:
+        filepath = await audio_queue.get()
+        
+        if filepath is None:
             rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
             stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
             llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
-            
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
             
-            print(f"\n⏱️ Süreler -> Kayıt: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Ollama İlk Kelime: {llm_first:.2f}s (Toplam: {llm_total:.2f}s) | 🔥 Tepki: {reaction_time:.2f}s")
+            print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Ollama First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
             print("-" * 50)
             
-            first_audio_sent = False
             can_listen_event.set()
         else:
-            sentence = item
-            if not process:
-                t1 = time.perf_counter()
-                if perf_metrics["first_audio_played"] == 0.0:
-                    perf_metrics["first_audio_played"] = time.perf_counter()
-                    
-                try:
-                    piper_aplay_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.1 --output_raw | aplay -q -r 22050 -f S16_LE -t raw -"
-                    process = await asyncio.create_subprocess_shell(
-                        piper_aplay_cmd,
-                        stdin=asyncio.subprocess.PIPE,
-                        stdout=asyncio.subprocess.DEVNULL,
-                        stderr=asyncio.subprocess.DEVNULL
-                    )
-                except Exception as e:
-                    print(f"❌ Oynatma başlatma hatası: {e}")
-                    process = None
-            
-            if process:
-                try:
-                    process.stdin.write((sentence + "\n").encode('utf-8'))
-                    await process.stdin.drain()
-                except Exception as e:
-                    print(f"❌ Oynatma yazma hatası: {e}")
-        playback_queue.task_done()
+            if perf_metrics["first_audio_played"] == 0.0:
+                perf_metrics["first_audio_played"] = time.perf_counter()
+                
+            try:
+                play_cmd = f"aplay -q {filepath}"
+                process = await asyncio.create_subprocess_shell(play_cmd)
+                await process.wait() 
+            except Exception as e:
+                print(f"❌ Audio play error: {e}")
+            finally:
+                if os.path.exists(filepath):
+                    os.remove(filepath)
+                
+        audio_queue.task_done()
 
 async def main():
     setup_directories()
-    print("\n🚀 Hızlı Kesme Akış Sistemi Başlatıldı (Paralel Piper+Aplay).")
+    print("\n🚀 Perfect English Chatbot Started (Parallel Piper Generator & Aplay).")
     await warmup_llm()
     
     stt_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS)
@@ -457,20 +426,40 @@ async def main():
     asyncio.create_task(stt_worker(stt_model))
     asyncio.create_task(llm_worker())
     asyncio.create_task(tts_chunk_worker())
-    asyncio.create_task(playback_worker())
+    asyncio.create_task(tts_generator_worker())
+    asyncio.create_task(audio_player_worker())
     
+    # Giriş cümlesini de yeni sisteme uygun güvenli şekilde hazırlıyoruz
     try:
-        piper_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.1 --output_raw | aplay -q -r 22050 -f S16_LE -t raw -"
+        temp_intro = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+        temp_intro_path = temp_intro.name
+        temp_intro.close()
+        
+        piper_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.1 --output_file {temp_intro_path}"
         process = await asyncio.create_subprocess_shell(
             piper_cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
         )
-        await process.communicate(input="Please choose your English level: A1, A2, B1 or B2.".encode('utf-8'))
+        intro_text = "Hello! I am ready. What would you like to talk about?"
+        print(f"🤖 Assistant: {intro_text}")
+        process.stdin.write((intro_text + "\n").encode('utf-8'))
+        await process.stdin.drain() # EKLEME 2: Buffer tıkanıklığını önler
+        process.stdin.close()
+        await process.wait()
+        
+        play_cmd = f"aplay -q {temp_intro_path}"
+        play_proc = await asyncio.create_subprocess_shell(play_cmd)
+        await play_proc.wait()
+        
+        conversation_history.append({"role": "assistant", "content": intro_text})
     except Exception as e:
-        print(f"❌ Startup TTS error: {e}")
+        print(f"Intro playback error: {e}")
+    finally:
+        if os.path.exists(temp_intro_path):
+            os.remove(temp_intro_path)
         
     can_listen_event.set()
     while True: await asyncio.sleep(1)
 
 if __name__ == "__main__":
     try: asyncio.run(main())
-    except KeyboardInterrupt: print("\n👋 Çıkış yapıldı.")
+    except KeyboardInterrupt: print("\n👋 Exited.")
