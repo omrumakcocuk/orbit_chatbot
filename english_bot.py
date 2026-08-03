@@ -4,7 +4,8 @@ import re
 import time
 import asyncio
 import collections
-import google.generativeai as genai
+from google import genai
+from google.genai import types
 import tempfile
 import aiohttp
 import soundfile as sf
@@ -17,6 +18,7 @@ load_dotenv()  # .env dosyasındaki ortam değişkenlerini sisteme yükler
 import numpy as np
 import sounddevice as sd
 
+# pyrefly: ignore [missing-import]
 from faster_whisper import WhisperModel
 import warnings
 warnings.filterwarnings("ignore")
@@ -52,12 +54,13 @@ except Exception as e:
 # --- GOOGLE AI STUDIO (GEMINI API) AYARLARI ---
 # API anahtarınız otomatik olarak .env dosyasından veya sistem değişkenlerinden yüklenir:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+gemini_client = None
 if GEMINI_API_KEY:
-    genai.configure(api_key=GEMINI_API_KEY)
+    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
 else:
     print("⚠️ UYARI: GEMINI_API_KEY bulunamadı! Lütfen .env dosyasına GEMINI_API_KEY=... ekleyin.")
 
-GEMINI_MODEL_NAME = "gemini-3.5-flash"
+GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 WHISPER_MODEL_SIZE = "base"
 
 LLM_CONTEXT_SIZE = 1024
@@ -80,6 +83,9 @@ VOICE_OPTIONS = [
             "Hello, I'm Adam. I'm ready. "
             "What would you like to talk about today?"
         ),
+        "farewell": (
+            "Goodbye! It was great talking to you. Have a wonderful day!"
+        ),
         "system_prompt": (
             "You are Adam, a friendly, natural and confident American male "
             "English conversation partner. Always reply in English. "
@@ -93,6 +99,9 @@ VOICE_OPTIONS = [
             "Hi there, I'm Heart. I'm ready. "
             "What would you like to talk about?"
         ),
+        "farewell": (
+            "Bye for now! I really enjoyed our chat. See you next time!"
+        ),
         "system_prompt": (
             "You are Heart, a warm, friendly and helpful American female "
             "English conversation partner. Always reply in English. "
@@ -105,6 +114,7 @@ selected_voice = random.choice(VOICE_OPTIONS)
 ACTIVE_VOICE_ID = selected_voice["id"]
 ACTIVE_VOICE_NAME = selected_voice["name"]
 ACTIVE_INTRO_TEXT = selected_voice["intro"]
+ACTIVE_FAREWELL_TEXT = selected_voice.get("farewell", "Goodbye! Have a great day!")
 ACTIVE_SYSTEM_PROMPT = selected_voice["system_prompt"]
 
 def reset_metrics():
@@ -125,14 +135,18 @@ def setup_directories():
     os.makedirs("voices", exist_ok=True)
 
 async def warmup_llm():
+    global gemini_client
     print("Checking Gemini API configuration...")
-    if not GEMINI_API_KEY:
+    if not GEMINI_API_KEY and not os.environ.get("GEMINI_API_KEY"):
         print("⚠️ UYARI: Google AI Studio için GEMINI_API_KEY bulunamadı! Lütfen .env dosyanızda tanımlı olduğundan emin olun.")
     else:
         try:
-            genai.configure(api_key=GEMINI_API_KEY)
-            model = genai.GenerativeModel(GEMINI_MODEL_NAME)
-            await asyncio.to_thread(model.generate_content, "Hi")
+            if not gemini_client:
+                gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
+            await gemini_client.aio.models.generate_content(
+                model=GEMINI_MODEL_NAME,
+                contents="Hi",
+            )
             print("✅ Gemini API connection tested successfully.")
         except Exception as e:
             print(f"⚠️ Gemini API warmup/connection error: {e}")
@@ -216,7 +230,7 @@ def transcribe_audio_sync(stt_model, audio_data):
         
         lower_text = text.lower()
         # İNGİLİZCE HALÜSİNASYONLAR
-        hallucinations = ["thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "amara.org", "bye"]
+        hallucinations = ["thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "amara.org"]
         for h in hallucinations: lower_text = lower_text.replace(h, "")
         if len(re.sub(r'[^\w\s]', '', lower_text).strip()) <= 1: return ""
         return text
@@ -278,6 +292,27 @@ async def stt_worker(stt_model):
         
         if text:
             user_has_spoken = True
+            clean_cmd = re.sub(r'[^\w\s]', '', text.lower()).strip()
+            if clean_cmd in ["bye", "goodbye", "good bye", "bye bye", "see you", "exit", "stop", "quit"]:
+                print(f"🗣️ You: {text}")
+                print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
+                try:
+                    temp_bye = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
+                    temp_bye_path = temp_bye.name
+                    temp_bye.close()
+                    if kokoro_tts:
+                        samples, sample_rate = await asyncio.to_thread(
+                            kokoro_tts.create, ACTIVE_FAREWELL_TEXT, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
+                        )
+                        await asyncio.to_thread(sf.write, temp_bye_path, samples, sample_rate)
+                    play_proc = await asyncio.create_subprocess_shell(f"aplay -q {temp_bye_path}")
+                    await play_proc.wait()
+                    if os.path.exists(temp_bye_path):
+                        os.remove(temp_bye_path)
+                except Exception as e:
+                    print(f"Farewell playback error: {e}")
+                print("\n👋 Assistant shut down cleanly.")
+                os._exit(0)
             await llm_queue.put(text)
         else:
             await tts_queue.put(None)
@@ -287,9 +322,15 @@ async def llm_worker():
     global conversation_history
     system_prompt = ACTIVE_SYSTEM_PROMPT
     
-    generation_config = genai.types.GenerationConfig(
+    # Gemini 3 modeli için MINIMAL thinking (düşünme) yapılandırması
+    generation_config = types.GenerateContentConfig(
         temperature=LLM_TEMPERATURE,
         max_output_tokens=LLM_MAX_TOKENS,
+        system_instruction=system_prompt,
+        thinking_config=types.ThinkingConfig(
+            thinking_level="MINIMAL",
+            include_thoughts=False
+        )
     )
     
     while True:
@@ -301,14 +342,12 @@ async def llm_worker():
         
         full_response = ""
         try:
-            model = genai.GenerativeModel(
-                model_name=GEMINI_MODEL_NAME,
-                system_instruction=system_prompt,
-                generation_config=generation_config
+            messages = [*conversation_history, {"role": "user", "parts": [{"text": text}]}]
+            response = await gemini_client.aio.models.generate_content_stream(
+                model=GEMINI_MODEL_NAME,
+                contents=messages,
+                config=generation_config
             )
-            
-            messages = [*conversation_history, {"role": "user", "parts": [text]}]
-            response = await model.generate_content_async(messages, stream=True)
             
             async for chunk in response:
                 try:
@@ -329,8 +368,8 @@ async def llm_worker():
                     await tts_queue.put(clean_chunk)
                     
             if full_response.strip():
-                conversation_history.append({"role": "user", "parts": [text]})
-                conversation_history.append({"role": "model", "parts": [full_response.strip()]})
+                conversation_history.append({"role": "user", "parts": [{"text": text}]})
+                conversation_history.append({"role": "model", "parts": [{"text": full_response.strip()}]})
                 conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
                 if conversation_history and conversation_history[0]["role"] == "model":
                     conversation_history.pop(0)
@@ -470,8 +509,8 @@ async def main():
         play_proc = await asyncio.create_subprocess_shell(play_cmd)
         await play_proc.wait()
         
-        conversation_history.append({"role": "user", "parts": ["Hello! Are you ready?"]})
-        conversation_history.append({"role": "model", "parts": [intro_text]})
+        conversation_history.append({"role": "user", "parts": [{"text": "Hello! Are you ready?"}]})
+        conversation_history.append({"role": "model", "parts": [{"text": intro_text}]})
     except Exception as e:
         print(f"Intro playback error: {e}")
     finally:

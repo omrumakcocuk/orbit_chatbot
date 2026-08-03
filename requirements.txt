@@ -2,7 +2,7 @@ aiohttp
 numpy
 sounddevice
 faster-whisper
-google-generativeai
+google-genai
 kokoro-onnx
 soundfile
 python-dotenv
