@@ -7,6 +7,9 @@ import collections
 import ollama
 import tempfile
 import aiohttp
+import soundfile as sf
+import random
+from kokoro_onnx import Kokoro
 
 import numpy as np
 import sounddevice as sd
@@ -23,19 +26,28 @@ WHISPER_THREADS = max(1, TOTAL_LOGICAL_CORES - 1)
 # --- YAPILANDIRMA (Hızlı Kesme Odaklı) ---
 SAMPLE_RATE = 16000 
 CHANNELS = 1
-SPEECH_THRESHOLD = 5000 
+SPEECH_THRESHOLD = 4000
 START_BLOCK_COUNT = 2    
-SILENCE_DURATION = 0.3   
+SILENCE_DURATION = 0.7   
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.3   
 MIN_RECORDING_AFTER_SPEECH_START = 0.3
-MAX_RECORDING_DURATION = 15.0 
 
 # İNGİLİZCE MODELLER
-PIPER_MODEL = "voices/en_US-lessac-medium.onnx"
+KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
+KOKORO_VOICES = "voices/voices-v1.0.bin"
+
+try:
+    print("Loading Kokoro TTS model...")
+    kokoro_tts = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+    print("✅ Kokoro TTS loaded.")
+except Exception as e:
+    print(f"⚠️ Failed to load Kokoro TTS: {e}")
+    kokoro_tts = None
+
 OLLAMA_MODEL = "gemma4:e2b"
-WHISPER_MODEL_SIZE = "tiny"
+WHISPER_MODEL_SIZE = "base"
 
 LLM_CONTEXT_SIZE = 1024
 LLM_MAX_TOKENS = 150
@@ -44,6 +56,45 @@ MAX_HISTORY_MESSAGES = 6
 
 perf_metrics = {}
 conversation_history = []
+user_has_spoken = True
+
+# --- RASTGELE SESLİ ASİSTAN SEÇİMİ ---
+# Program her açıldığında aşağıdaki asistanlardan biri seçilir.
+# Seçilen asistan, konuşma boyunca değişmeden kullanılır.
+VOICE_OPTIONS = [
+    {
+        "id": "am_adam",
+        "name": "Adam",
+        "intro": (
+            "Hello, I'm Adam. I'm ready. "
+            "What would you like to talk about today?"
+        ),
+        "system_prompt": (
+            "You are Adam, a friendly, natural and confident American male "
+            "English conversation partner. Always reply in English. "
+            "Keep your answers short and conversational."
+        ),
+    },
+    {
+        "id": "af_heart",
+        "name": "Heart",
+        "intro": (
+            "Hi there, I'm Heart. I'm ready. "
+            "What would you like to talk about?"
+        ),
+        "system_prompt": (
+            "You are Heart, a warm, friendly and helpful American female "
+            "English conversation partner. Always reply in English. "
+            "Keep your answers short and conversational."
+        ),
+    },
+]
+
+selected_voice = random.choice(VOICE_OPTIONS)
+ACTIVE_VOICE_ID = selected_voice["id"]
+ACTIVE_VOICE_NAME = selected_voice["name"]
+ACTIVE_INTRO_TEXT = selected_voice["intro"]
+ACTIVE_SYSTEM_PROMPT = selected_voice["system_prompt"]
 
 def reset_metrics():
     global perf_metrics
@@ -114,10 +165,6 @@ def record_audio_sync(fs, channels):
                 elapsed_total = current_time - start_time
                 
                 if not speech_started and elapsed_total > WAIT_FOR_SPEECH_TIMEOUT:
-                    break
-                    
-                # YENİ: Maksimum kayıt süresini aşarsak zorla kes (RAM şişmesini engeller)
-                if speech_started and (current_time - first_speech_block_time) > MAX_RECORDING_DURATION:
                     break
                     
                 data, overflowed = stream.read(block_size)
@@ -203,14 +250,14 @@ audio_queue = asyncio.Queue() # YENİ: Hazır ses dosyaları için kuyruk
 can_listen_event = asyncio.Event()
 
 async def vad_worker():
+    global user_has_spoken
     consecutive_timeouts = 0  
-    is_listening_printed = False
     while True:
         await can_listen_event.wait()
         
-        if not is_listening_printed:
+        if user_has_spoken:
             print("\n🎤 Listening...")
-            is_listening_printed = True
+            user_has_spoken = False
             
         reset_metrics()
         perf_metrics["rec_start"] = time.perf_counter()
@@ -220,23 +267,15 @@ async def vad_worker():
         
         if isinstance(audio_data, np.ndarray):
             consecutive_timeouts = 0
-            is_listening_printed = False
             can_listen_event.clear()
             await stt_queue.put(audio_data)
         elif audio_data == "TIMEOUT":
-            if consecutive_timeouts == 0:
-                can_listen_event.clear()
-                await tts_queue.put("I haven't heard you for a while, could you please repeat?")
-                await tts_queue.put(None)
-                consecutive_timeouts += 1
-                is_listening_printed = False
-            else:
-                await asyncio.sleep(0.1)
+            await asyncio.sleep(0.1)
         else:
             await asyncio.sleep(0.1)
 
 async def stt_worker(stt_model):
-    consecutive_unintelligible = 0
+    global user_has_spoken
     while True:
         audio_data = await stt_queue.get()
         perf_metrics["stt_start"] = time.perf_counter()
@@ -244,18 +283,15 @@ async def stt_worker(stt_model):
         perf_metrics["stt_end"] = time.perf_counter()
         
         if text:
-            consecutive_unintelligible = 0
+            user_has_spoken = True
             await llm_queue.put(text)
         else:
-            consecutive_unintelligible += 1
-            if consecutive_unintelligible == 2:
-                await tts_queue.put("I couldn't quite catch that, could you please repeat?")
             await tts_queue.put(None)
         stt_queue.task_done()
 
 async def llm_worker():
     global conversation_history
-    system_prompt = "You are a friendly, natural and helpful English conversation partner. Always reply in English. Keep your answers short and conversational."
+    system_prompt = ACTIVE_SYSTEM_PROMPT
     
     client = ollama.AsyncClient()
     
@@ -360,24 +396,17 @@ async def tts_generator_worker():
             temp_file.close()
 
             try:
-                piper_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.09 --output_file {temp_filepath}"
-                
-                process = await asyncio.create_subprocess_shell(
-                    piper_cmd,
-                    stdin=asyncio.subprocess.PIPE,
-                    stdout=asyncio.subprocess.DEVNULL,
-                    stderr=asyncio.subprocess.DEVNULL
-                )
-                
-                process.stdin.write((sentence + "\n").encode('utf-8'))
-                await process.stdin.drain() # EKLEME 2: Buffer tıkanıklığını önler
-                process.stdin.close() 
-                await process.wait() 
-                
-                await audio_queue.put(temp_filepath)
+                if kokoro_tts:
+                    samples, sample_rate = await asyncio.to_thread(
+                        kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
+                    )
+                    await asyncio.to_thread(sf.write, temp_filepath, samples, sample_rate)
+                    await audio_queue.put(temp_filepath)
+                else:
+                    raise Exception("Kokoro TTS not loaded")
                 
             except Exception as e:
-                print(f"❌ Piper generation error: {e}")
+                print(f"❌ Kokoro generation error: {e}")
                 if os.path.exists(temp_filepath):
                     os.remove(temp_filepath)
                 
@@ -395,9 +424,10 @@ async def audio_player_worker():
             llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
             
-            print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Ollama First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
-            print("-" * 50)
-            
+            if perf_metrics["llm_start"] > 0:
+                print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Ollama First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
+                print("-" * 50)
+                
             can_listen_event.set()
         else:
             if perf_metrics["first_audio_played"] == 0.0:
@@ -435,16 +465,14 @@ async def main():
         temp_intro_path = temp_intro.name
         temp_intro.close()
         
-        piper_cmd = f"venv/bin/piper --model {PIPER_MODEL} --length_scale 0.80 --sentence_silence 0.1 --output_file {temp_intro_path}"
-        process = await asyncio.create_subprocess_shell(
-            piper_cmd, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.DEVNULL
-        )
-        intro_text = "Hello! I am ready. What would you like to talk about?"
-        print(f"🤖 Assistant: {intro_text}")
-        process.stdin.write((intro_text + "\n").encode('utf-8'))
-        await process.stdin.drain() # EKLEME 2: Buffer tıkanıklığını önler
-        process.stdin.close()
-        await process.wait()
+        intro_text = ACTIVE_INTRO_TEXT
+        print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
+        
+        if kokoro_tts:
+            samples, sample_rate = await asyncio.to_thread(
+                kokoro_tts.create, intro_text, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
+            )
+            await asyncio.to_thread(sf.write, temp_intro_path, samples, sample_rate)
         
         play_cmd = f"aplay -q {temp_intro_path}"
         play_proc = await asyncio.create_subprocess_shell(play_cmd)
