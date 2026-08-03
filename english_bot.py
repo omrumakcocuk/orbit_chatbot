@@ -1,14 +1,10 @@
 import os
-import json
 import re
 import time
 import asyncio
 import collections
 from google import genai
 from google.genai import types
-import tempfile
-import aiohttp
-import soundfile as sf
 import random
 from kokoro_onnx import Kokoro
 from dotenv import load_dotenv
@@ -64,9 +60,11 @@ GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
 WHISPER_MODEL_SIZE = "base"
 
 LLM_CONTEXT_SIZE = 1024
-LLM_MAX_TOKENS = 150
+LLM_MAX_TOKENS = 80
 LLM_TEMPERATURE = 0.3
-MAX_HISTORY_MESSAGES = 6
+MAX_HISTORY_MESSAGES = 4
+FIRST_TTS_WORDS = 2
+TTS_WORKER_COUNT = 2
 
 perf_metrics = {}
 conversation_history = []
@@ -254,8 +252,14 @@ stt_queue = asyncio.Queue()
 llm_queue = asyncio.Queue()
 tts_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
-audio_queue = asyncio.Queue() # YENİ: Hazır ses dosyaları için kuyruk
+audio_queue = asyncio.Queue() # Bellekte tutulan ses parçaları için kuyruk
 can_listen_event = asyncio.Event()
+playback_sequence = 0
+playback_turn_id = 0
+
+def play_audio_sync(samples, sample_rate):
+    sd.play(samples, sample_rate)
+    sd.wait()
 
 async def vad_worker():
     global user_has_spoken
@@ -297,18 +301,11 @@ async def stt_worker(stt_model):
                 print(f"🗣️ You: {text}")
                 print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
                 try:
-                    temp_bye = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-                    temp_bye_path = temp_bye.name
-                    temp_bye.close()
                     if kokoro_tts:
                         samples, sample_rate = await asyncio.to_thread(
                             kokoro_tts.create, ACTIVE_FAREWELL_TEXT, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
                         )
-                        await asyncio.to_thread(sf.write, temp_bye_path, samples, sample_rate)
-                    play_proc = await asyncio.create_subprocess_shell(f"aplay -q {temp_bye_path}")
-                    await play_proc.wait()
-                    if os.path.exists(temp_bye_path):
-                        os.remove(temp_bye_path)
+                        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
                 except Exception as e:
                     print(f"Farewell playback error: {e}")
                 print("\n👋 Assistant shut down cleanly.")
@@ -382,6 +379,7 @@ async def llm_worker():
         llm_queue.task_done()
 
 async def tts_chunk_worker():
+    global playback_sequence, playback_turn_id
     sentence_buffer = ""
     delimiters = re.compile(r'([.?!:,;\n]+)')
     is_first_chunk = True
@@ -390,30 +388,36 @@ async def tts_chunk_worker():
         chunk = await tts_queue.get()
         
         if chunk is None:
+            current_turn_id = playback_turn_id
             if sentence_buffer.strip():
                 clean_sent = clean_text_for_tts(sentence_buffer)
                 if any(c.isalnum() for c in clean_sent): 
-                    await playback_queue.put(clean_sent)
+                    await playback_queue.put((current_turn_id, playback_sequence, clean_sent))
+                    playback_sequence += 1
             sentence_buffer = ""
             is_first_chunk = True
-            await playback_queue.put(None)
+            for _ in range(TTS_WORKER_COUNT):
+                await playback_queue.put(("END", current_turn_id, playback_sequence))
+            playback_turn_id += 1
+            playback_sequence = 0
         else:
             sentence_buffer += chunk
             
             while True:
                 match = delimiters.search(sentence_buffer)
                 if not match:
-                    # İlk ses çıkışını hızlandırmak için sadece ilk cümlecik 4 kelimeye ulaşır ulaşmaz anında ateşlenir:
-                    if is_first_chunk and len(sentence_buffer.split()) >= 4:
+                    # İlk ses çıkışını hızlandırmak için ilk cümlecik erken ateşlenir.
+                    if is_first_chunk and len(sentence_buffer.split()) >= FIRST_TTS_WORDS:
                         words = sentence_buffer.split()
-                        first_part = " ".join(words[:4]).strip()
-                        sentence_buffer = " ".join(words[4:]).strip()
+                        first_part = " ".join(words[:FIRST_TTS_WORDS]).strip()
+                        sentence_buffer = " ".join(words[FIRST_TTS_WORDS:]).strip()
                         if sentence_buffer:
                             sentence_buffer = " " + sentence_buffer
                         
                         clean_sent = clean_text_for_tts(first_part)
                         if any(c.isalnum() for c in clean_sent): 
-                            await playback_queue.put(clean_sent)
+                            await playback_queue.put((playback_turn_id, playback_sequence, clean_sent))
+                            playback_sequence += 1
                             is_first_chunk = False
                         continue
                     break
@@ -424,71 +428,82 @@ async def tts_chunk_worker():
                 
                 clean_sent = clean_text_for_tts(sentence)
                 if any(c.isalnum() for c in clean_sent): 
-                    await playback_queue.put(clean_sent)
+                    await playback_queue.put((playback_turn_id, playback_sequence, clean_sent))
+                    playback_sequence += 1
                     is_first_chunk = False
                 
         tts_queue.task_done()
 
-# YENİ: Sadece metni Piper'a gönderip sesi geçici bir wav dosyasına kaydeder
+# YENİ: Metni sese çevirir ve bellekteki audio parçalarını kuyruğa yollar
 async def tts_generator_worker():
     while True:
         item = await playback_queue.get()
         
-        if item is None:
-            await audio_queue.put(None)
+        if isinstance(item, tuple) and item and item[0] == "END":
+            _, turn_id, total_sequences = item
+            await audio_queue.put(("END", turn_id, total_sequences))
         else:
-            sentence = item
-            temp_file = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-            temp_filepath = temp_file.name
-            temp_file.close()
+            turn_id, sequence_id, sentence = item
 
             try:
                 if kokoro_tts:
                     samples, sample_rate = await asyncio.to_thread(
                         kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
                     )
-                    await asyncio.to_thread(sf.write, temp_filepath, samples, sample_rate)
-                    await audio_queue.put(temp_filepath)
+                    await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
                 else:
                     raise Exception("Kokoro TTS not loaded")
                 
             except Exception as e:
                 print(f"❌ Kokoro generation error: {e}")
-                if os.path.exists(temp_filepath):
-                    os.remove(temp_filepath)
                 
         playback_queue.task_done()
 
-# YENİ: Sadece hazır ses dosyalarını alır ve hiç beklemeden arka arkaya çalar
+# YENİ: Hazır ses parçalarını sırası korunarak çalar
 async def audio_player_worker():
+    current_turn_id = 0
+    next_sequence_id = 0
+    pending_audio = {}
+    turn_end_markers = {}
+
     while True:
-        filepath = await audio_queue.get()
+        item = await audio_queue.get()
         
-        if filepath is None:
+        if isinstance(item, tuple) and item and item[0] == "END":
+            _, turn_id, total_sequences = item
+            turn_end_markers[turn_id] = total_sequences
+        else:
+            turn_id, sequence_id, samples, sample_rate = item
+            pending_audio[(turn_id, sequence_id)] = (samples, sample_rate)
+
+        while (current_turn_id, next_sequence_id) in pending_audio:
+            samples, sample_rate = pending_audio.pop((current_turn_id, next_sequence_id))
+            if perf_metrics["first_audio_played"] == 0.0:
+                perf_metrics["first_audio_played"] = time.perf_counter()
+
+            try:
+                await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+            except Exception as e:
+                print(f"❌ Audio play error: {e}")
+
+            next_sequence_id += 1
+
+        expected_sequences = turn_end_markers.get(current_turn_id)
+        if expected_sequences is not None and next_sequence_id >= expected_sequences:
             rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
             stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
             llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
-            
+
             if perf_metrics["llm_start"] > 0:
                 print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
                 print("-" * 50)
-                
+
+            turn_end_markers.pop(current_turn_id, None)
+            current_turn_id += 1
+            next_sequence_id = 0
             can_listen_event.set()
-        else:
-            if perf_metrics["first_audio_played"] == 0.0:
-                perf_metrics["first_audio_played"] = time.perf_counter()
-                
-            try:
-                play_cmd = f"aplay -q {filepath}"
-                process = await asyncio.create_subprocess_shell(play_cmd)
-                await process.wait() 
-            except Exception as e:
-                print(f"❌ Audio play error: {e}")
-            finally:
-                if os.path.exists(filepath):
-                    os.remove(filepath)
                 
         audio_queue.task_done()
 
@@ -503,15 +518,12 @@ async def main():
     asyncio.create_task(stt_worker(stt_model))
     asyncio.create_task(llm_worker())
     asyncio.create_task(tts_chunk_worker())
-    asyncio.create_task(tts_generator_worker())
+    for _ in range(TTS_WORKER_COUNT):
+        asyncio.create_task(tts_generator_worker())
     asyncio.create_task(audio_player_worker())
     
     # Giriş cümlesini de yeni sisteme uygun güvenli şekilde hazırlıyoruz
     try:
-        temp_intro = tempfile.NamedTemporaryFile(suffix=".wav", delete=False)
-        temp_intro_path = temp_intro.name
-        temp_intro.close()
-        
         intro_text = ACTIVE_INTRO_TEXT
         print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
         
@@ -519,19 +531,12 @@ async def main():
             samples, sample_rate = await asyncio.to_thread(
                 kokoro_tts.create, intro_text, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
             )
-            await asyncio.to_thread(sf.write, temp_intro_path, samples, sample_rate)
-        
-        play_cmd = f"aplay -q {temp_intro_path}"
-        play_proc = await asyncio.create_subprocess_shell(play_cmd)
-        await play_proc.wait()
+            await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         
         conversation_history.append({"role": "user", "parts": [{"text": "Hello! Are you ready?"}]})
         conversation_history.append({"role": "model", "parts": [{"text": intro_text}]})
     except Exception as e:
         print(f"Intro playback error: {e}")
-    finally:
-        if os.path.exists(temp_intro_path):
-            os.remove(temp_intro_path)
         
     can_listen_event.set()
     while True: await asyncio.sleep(1)
