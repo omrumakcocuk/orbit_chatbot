@@ -33,7 +33,7 @@ SAMPLE_RATE = 16000
 CHANNELS = 1
 SPEECH_THRESHOLD = 4000
 START_BLOCK_COUNT = 2    
-SILENCE_DURATION = 0.7   
+SILENCE_DURATION = 0.45   
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.3   
@@ -383,7 +383,8 @@ async def llm_worker():
 
 async def tts_chunk_worker():
     sentence_buffer = ""
-    delimiters = re.compile(r'([.?!:\n]+)')
+    delimiters = re.compile(r'([.?!:,;\n]+)')
+    is_first_chunk = True
     
     while True:
         chunk = await tts_queue.get()
@@ -394,6 +395,7 @@ async def tts_chunk_worker():
                 if any(c.isalnum() for c in clean_sent): 
                     await playback_queue.put(clean_sent)
             sentence_buffer = ""
+            is_first_chunk = True
             await playback_queue.put(None)
         else:
             sentence_buffer += chunk
@@ -401,6 +403,19 @@ async def tts_chunk_worker():
             while True:
                 match = delimiters.search(sentence_buffer)
                 if not match:
+                    # İlk ses çıkışını hızlandırmak için sadece ilk cümlecik 4 kelimeye ulaşır ulaşmaz anında ateşlenir:
+                    if is_first_chunk and len(sentence_buffer.split()) >= 4:
+                        words = sentence_buffer.split()
+                        first_part = " ".join(words[:4]).strip()
+                        sentence_buffer = " ".join(words[4:]).strip()
+                        if sentence_buffer:
+                            sentence_buffer = " " + sentence_buffer
+                        
+                        clean_sent = clean_text_for_tts(first_part)
+                        if any(c.isalnum() for c in clean_sent): 
+                            await playback_queue.put(clean_sent)
+                            is_first_chunk = False
+                        continue
                     break
                     
                 end_idx = match.end()
@@ -410,6 +425,7 @@ async def tts_chunk_worker():
                 clean_sent = clean_text_for_tts(sentence)
                 if any(c.isalnum() for c in clean_sent): 
                     await playback_queue.put(clean_sent)
+                    is_first_chunk = False
                 
         tts_queue.task_done()
 
