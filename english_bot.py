@@ -4,12 +4,15 @@ import re
 import time
 import asyncio
 import collections
-import ollama
+import google.generativeai as genai
 import tempfile
 import aiohttp
 import soundfile as sf
 import random
 from kokoro_onnx import Kokoro
+from dotenv import load_dotenv
+
+load_dotenv()  # .env dosyasındaki ortam değişkenlerini sisteme yükler
 
 import numpy as np
 import sounddevice as sd
@@ -46,7 +49,15 @@ except Exception as e:
     print(f"⚠️ Failed to load Kokoro TTS: {e}")
     kokoro_tts = None
 
-OLLAMA_MODEL = "gemma4:e2b"
+# --- GOOGLE AI STUDIO (GEMINI API) AYARLARI ---
+# API anahtarınız otomatik olarak .env dosyasından veya sistem değişkenlerinden yüklenir:
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+else:
+    print("⚠️ UYARI: GEMINI_API_KEY bulunamadı! Lütfen .env dosyasına GEMINI_API_KEY=... ekleyin.")
+
+GEMINI_MODEL_NAME = "gemini-3.5-flash"
 WHISPER_MODEL_SIZE = "base"
 
 LLM_CONTEXT_SIZE = 1024
@@ -114,34 +125,17 @@ def setup_directories():
     os.makedirs("voices", exist_ok=True)
 
 async def warmup_llm():
-    url = "http://localhost:11434/api/chat"
-    payload = {
-        "model": OLLAMA_MODEL,
-        "messages": [{"role": "user", "content": "Reply with only: Ready"}],
-        "stream": False,
-        "think": False,
-        "keep_alive": -1,
-        "options": {
-            "num_ctx": LLM_CONTEXT_SIZE,
-            "num_thread": LLM_THREADS,
-            "temperature": 0.0,
-            "num_predict": 10
-        }
-    }
-
-    try:
-        # Modelin ilk yüklenmesi 3 saniyeden uzun sürebildiği için güvenli timeout.
-        timeout = aiohttp.ClientTimeout(total=30.0)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(url, json=payload) as response:
-                response.raise_for_status()
-                await response.json()
-
-        print("✅ Ollama warmup completed.")
-
-    except Exception as e:
-        # Warmup başarısız olsa bile chatbot çalışmaya devam eder.
-        print(f"⚠️ Ollama warmup error: {e}")
+    print("Checking Gemini API configuration...")
+    if not GEMINI_API_KEY:
+        print("⚠️ UYARI: Google AI Studio için GEMINI_API_KEY bulunamadı! Lütfen .env dosyanızda tanımlı olduğundan emin olun.")
+    else:
+        try:
+            genai.configure(api_key=GEMINI_API_KEY)
+            model = genai.GenerativeModel(GEMINI_MODEL_NAME)
+            await asyncio.to_thread(model.generate_content, "Hi")
+            print("✅ Gemini API connection tested successfully.")
+        except Exception as e:
+            print(f"⚠️ Gemini API warmup/connection error: {e}")
 
 def record_audio_sync(fs, channels):
     block_size = int(fs * BLOCK_DURATION)
@@ -293,7 +287,10 @@ async def llm_worker():
     global conversation_history
     system_prompt = ACTIVE_SYSTEM_PROMPT
     
-    client = ollama.AsyncClient()
+    generation_config = genai.types.GenerationConfig(
+        temperature=LLM_TEMPERATURE,
+        max_output_tokens=LLM_MAX_TOKENS,
+    )
     
     while True:
         text = await llm_queue.get()
@@ -304,28 +301,21 @@ async def llm_worker():
         
         full_response = ""
         try:
-            messages = [
-                {"role": "system", "content": system_prompt},
-                *conversation_history,
-                {"role": "user", "content": text}
-            ]
-            
-            response = await client.chat(
-                model=OLLAMA_MODEL,
-                messages=messages,
-                think=False,
-                stream=True,
-                keep_alive=-1,
-                options={
-                    "num_ctx": LLM_CONTEXT_SIZE, 
-                    "num_thread": LLM_THREADS, 
-                    "temperature": LLM_TEMPERATURE,
-                    "num_predict": LLM_MAX_TOKENS
-                }
+            model = genai.GenerativeModel(
+                model_name=GEMINI_MODEL_NAME,
+                system_instruction=system_prompt,
+                generation_config=generation_config
             )
             
+            messages = [*conversation_history, {"role": "user", "parts": [text]}]
+            response = await model.generate_content_async(messages, stream=True)
+            
             async for chunk in response:
-                content = chunk.get("message", {}).get("content", "")
+                try:
+                    content = chunk.text
+                except Exception:
+                    content = ""
+                    
                 if content:
                     if perf_metrics["llm_first_token"] == 0.0:
                         perf_metrics["llm_first_token"] = time.perf_counter()
@@ -339,11 +329,13 @@ async def llm_worker():
                     await tts_queue.put(clean_chunk)
                     
             if full_response.strip():
-                conversation_history.append({"role": "user", "content": text})
-                conversation_history.append({"role": "assistant", "content": full_response.strip()})
+                conversation_history.append({"role": "user", "parts": [text]})
+                conversation_history.append({"role": "model", "parts": [full_response.strip()]})
                 conversation_history[:] = conversation_history[-MAX_HISTORY_MESSAGES:]
+                if conversation_history and conversation_history[0]["role"] == "model":
+                    conversation_history.pop(0)
         except Exception as e:
-            print(f"\n❌ LLM Error: {e}")
+            print(f"\n❌ Gemini LLM Error: {e}")
             
         perf_metrics["llm_end"] = time.perf_counter()
         print() 
@@ -425,7 +417,7 @@ async def audio_player_worker():
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
             
             if perf_metrics["llm_start"] > 0:
-                print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Ollama First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
+                print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
                 print("-" * 50)
                 
             can_listen_event.set()
@@ -447,7 +439,7 @@ async def audio_player_worker():
 
 async def main():
     setup_directories()
-    print("\n🚀 Perfect English Chatbot Started (Parallel Piper Generator & Aplay).")
+    print("\n🚀 Perfect English Chatbot Started (Kokoro TTS & Google Gemini API & Aplay).")
     await warmup_llm()
     
     stt_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS)
@@ -478,7 +470,8 @@ async def main():
         play_proc = await asyncio.create_subprocess_shell(play_cmd)
         await play_proc.wait()
         
-        conversation_history.append({"role": "assistant", "content": intro_text})
+        conversation_history.append({"role": "user", "parts": ["Hello! Are you ready?"]})
+        conversation_history.append({"role": "model", "parts": [intro_text]})
     except Exception as e:
         print(f"Intro playback error: {e}")
     finally:

@@ -17,3 +17,6 @@ voices/
 # Editor Backups
 *.save
 main_yedek.py
+.env
+orbit_chatbot/
+/home/omrum/Desktop/orbit_chatbot/orbit_chatbot
