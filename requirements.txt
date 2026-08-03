@@ -2,3 +2,6 @@ aiohttp
 numpy
 sounddevice
 faster-whisper
+ollama
+kokoro-onnx
+soundfile
