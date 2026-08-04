@@ -50,7 +50,7 @@ Kokoro modunu kullanmak için aşağıda belirtilen model dosyaları `voices/` i
 #### B) Piper TTS Kurulumu (Varsayılan)
 `pip install -r requirements.txt` komutu Piper Python paketini kurar. Aşağıdaki model ve JSON dosyalarını `voices/` içerisine indirin:
 - [Amy medium](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/amy/medium): `en_US-amy-medium.onnx` ve `en_US-amy-medium.onnx.json`
-- [Bryce medium](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/bryce/medium): `en_US-bryce-medium.onnx` ve `en_US-bryce-medium.onnx.json`
+- [Ryan high](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/ryan/high): `en_US-ryan-high.onnx` ve `en_US-ryan-high.onnx.json`
 
 ---
 

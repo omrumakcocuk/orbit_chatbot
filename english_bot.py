@@ -93,18 +93,18 @@ EXIT_COMMANDS = {
 VOICE_OPTIONS = [
     {
         "id": "am_adam",
-        "name": "Bryce",
-        "piper_model": "voices/en_US-bryce-medium.onnx",
-        "piper_config": "voices/en_US-bryce-medium.onnx.json",
+        "name": "Ryan",
+        "piper_model": "voices/en_US-ryan-high.onnx",
+        "piper_config": "voices/en_US-ryan-high.onnx.json",
         "intro": (
-            "Hello, I'm Bryce. I'm ready. "
+            "Hello, I'm Ryan. I'm ready. "
             "What would you like to talk about today?"
         ),
         "farewell": (
             "Goodbye! It was great talking to you. Have a wonderful day!"
         ),
         "system_prompt": (
-            "You are Bryce, a friendly, natural and confident American male "
+            "You are Ryan, a friendly, natural and confident American male "
             "English conversation partner. Always reply in English. "
             "Answer in one or two short, complete, conversational sentences. "
             "Never stop mid-sentence."
