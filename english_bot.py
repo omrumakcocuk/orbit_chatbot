@@ -138,6 +138,9 @@ def reset_metrics():
         "llm_start": 0.0,
         "llm_first_token": 0.0,
         "llm_end": 0.0,
+        "first_tts_chunk_queued": 0.0,
+        "tts_first_start": 0.0,
+        "tts_first_ready": 0.0,
         "first_audio_played": 0.0
     }
 
@@ -602,6 +605,8 @@ async def tts_chunk_worker():
                         
                         clean_sent = clean_text_for_tts(first_part)
                         if any(c.isalnum() for c in clean_sent): 
+                            if perf_metrics["first_tts_chunk_queued"] == 0.0:
+                                perf_metrics["first_tts_chunk_queued"] = time.perf_counter()
                             await playback_queue.put((playback_turn_id, playback_sequence, clean_sent))
                             playback_sequence += 1
                             is_first_chunk = False
@@ -614,6 +619,8 @@ async def tts_chunk_worker():
                 
                 clean_sent = clean_text_for_tts(sentence)
                 if any(c.isalnum() for c in clean_sent): 
+                    if perf_metrics["first_tts_chunk_queued"] == 0.0:
+                        perf_metrics["first_tts_chunk_queued"] = time.perf_counter()
                     await playback_queue.put((playback_turn_id, playback_sequence, clean_sent))
                     playback_sequence += 1
                     is_first_chunk = False
@@ -633,9 +640,13 @@ async def tts_generator_worker():
 
             try:
                 if kokoro_tts:
+                    if perf_metrics["tts_first_start"] == 0.0:
+                        perf_metrics["tts_first_start"] = time.perf_counter()
                     samples, sample_rate = await asyncio.to_thread(
                         kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
                     )
+                    if perf_metrics["tts_first_ready"] == 0.0:
+                        perf_metrics["tts_first_ready"] = time.perf_counter()
                     await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
                 else:
                     raise Exception("Kokoro TTS not loaded")
@@ -690,6 +701,9 @@ async def audio_player_worker():
             stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
             llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
+            chunk_wait = perf_metrics["first_tts_chunk_queued"] - perf_metrics["llm_first_token"] if perf_metrics["first_tts_chunk_queued"] > 0 and perf_metrics["llm_first_token"] > 0 else 0
+            tts_gen = perf_metrics["tts_first_ready"] - perf_metrics["tts_first_start"] if perf_metrics["tts_first_ready"] > 0 and perf_metrics["tts_first_start"] > 0 else 0
+            playback_wait = perf_metrics["first_audio_played"] - perf_metrics["tts_first_ready"] if perf_metrics["first_audio_played"] > 0 and perf_metrics["tts_first_ready"] > 0 else 0
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
 
             if perf_metrics["llm_start"] > 0:
@@ -697,7 +711,9 @@ async def audio_player_worker():
                     f"\n⏱️ Timing -> Rec: {rec_time:.2f}s "
                     f"(Wait: {wait_time:.2f}s, Speech/end: {capture_time:.2f}s) | "
                     f"Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
-                    f"(Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s"
+                    f"(Total: {llm_total:.2f}s) | TTS Queue: {chunk_wait:.2f}s "
+                    f"| TTS Gen: {tts_gen:.2f}s | Play Wait: {playback_wait:.2f}s "
+                    f"| 🔥 Reaction: {reaction_time:.2f}s"
                 )
                 print("-" * 50)
 
