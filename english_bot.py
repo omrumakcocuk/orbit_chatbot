@@ -52,7 +52,7 @@ CALIBRATION_DURATION = 0.3
 SILENCE_DURATION = 0.6
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
 RECORDING_SAFETY_TIMEOUT = 60.0
-BLOCK_DURATION = 0.05
+BLOCK_DURATION = MIC_CHUNK / float(INPUT_SAMPLE_RATE)
 MIN_SPEECH_DURATION = 0.15
 MIN_RECORDING_AFTER_SPEECH_START = 0.20
 INPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
@@ -191,12 +191,24 @@ def print_audio_devices():
 
 
 def resolve_audio_devices():
+    pya = pyaudio.PyAudio()
     try:
-        default_input, default_output = sd.default.device
-        input_device = INPUT_DEVICE if INPUT_DEVICE is not None else default_input
+        _, default_output = sd.default.device
+        input_device = INPUT_DEVICE
         output_device = OUTPUT_DEVICE if OUTPUT_DEVICE is not None else default_output
 
-        input_info = sd.query_devices(input_device, "input") if input_device is not None else None
+        if input_device is None:
+            for index in range(pya.get_device_count()):
+                info = pya.get_device_info_by_index(index)
+                if "pulse" in info["name"].lower() and info["maxInputChannels"] > 0:
+                    input_device = index
+                    break
+
+        input_info = (
+            pya.get_device_info_by_index(input_device)
+            if input_device is not None
+            else None
+        )
         output_info = sd.query_devices(output_device, "output") if output_device is not None else None
 
         print("\nAudio device selection:")
@@ -214,6 +226,8 @@ def resolve_audio_devices():
         print(f"⚠️ Audio device selection failed: {e}")
         print_audio_devices()
         return INPUT_DEVICE, OUTPUT_DEVICE
+    finally:
+        pya.terminate()
 
 
 def downsample_audio(audio_data, source_rate, target_rate):
@@ -229,28 +243,28 @@ def downsample_audio(audio_data, source_rate, target_rate):
 
 def calibrate_microphone_sync(fs, channels):
     print("🎚️ Calibrating microphone; please stay quiet...", flush=True)
-    frame_count = max(1, int(fs * CALIBRATION_DURATION))
-    recording = sd.rec(
-        frame_count,
-        samplerate=fs,
-        channels=channels,
-        dtype="int16",
-        device=SELECTED_INPUT_DEVICE,
-    )
-    sd.wait()
-
-    audio = np.asarray(recording, dtype=np.float32)
-    if audio.ndim == 1:
-        audio = audio[:, None]
-
-    block_size = max(1, int(fs * BLOCK_DURATION))
+    pya = pyaudio.PyAudio()
     calibration_levels = []
-    for offset in range(0, len(audio), block_size):
-        block = audio[offset:offset + block_size]
-        if len(block) == 0:
-            continue
-        channel_rms = np.sqrt(np.mean(np.square(block), axis=0))
-        calibration_levels.append(float(np.max(channel_rms)))
+    stream = pya.open(
+        format=MIC_FORMAT,
+        channels=channels,
+        rate=fs,
+        input=True,
+        input_device_index=SELECTED_INPUT_DEVICE,
+        frames_per_buffer=MIC_CHUNK,
+    )
+    calibration_chunks = max(1, int(CALIBRATION_DURATION / BLOCK_DURATION))
+
+    try:
+        for _ in range(calibration_chunks):
+            data = stream.read(MIC_CHUNK, exception_on_overflow=False)
+            block = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
+            block = np.clip(block * MIC_GAIN, -32768.0, 32767.0)
+            calibration_levels.append(float(np.sqrt(np.mean(np.square(block)))))
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pya.terminate()
 
     noise_floor = float(np.median(calibration_levels)) if calibration_levels else 0.0
     start_threshold = max(
