@@ -72,7 +72,7 @@ LLM_MAX_TOKENS = 96
 LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
 FIRST_TTS_WORDS = 5
-NEXT_TTS_WORDS = 8
+NEXT_TTS_WORDS = 10
 TTS_WORKER_COUNT = 2
 
 perf_metrics = {}
@@ -419,6 +419,52 @@ audio_queue = asyncio.Queue() # Bellekte tutulan ses parçaları için kuyruk
 can_listen_event = asyncio.Event()
 shutdown_event = asyncio.Event()
 
+class ContinuousAudioPlayer:
+    def __init__(self):
+        self.stream = None
+        self.stream_format = None
+        self.started = False
+
+    def _ensure_stream(self, sample_rate, channels, dtype):
+        stream_format = (sample_rate, channels, dtype)
+        if self.stream is not None and self.stream_format != stream_format:
+            self.close()
+
+        if self.stream is None:
+            self.stream = sd.OutputStream(
+                samplerate=sample_rate,
+                channels=channels,
+                dtype=dtype,
+                device=SELECTED_OUTPUT_DEVICE,
+            )
+            self.stream_format = stream_format
+
+        if not self.started:
+            self.stream.start()
+            self.started = True
+
+    def play(self, samples, sample_rate):
+        audio = np.asarray(samples)
+        if audio.dtype not in (np.float32, np.float64, np.int16, np.int32):
+            audio = audio.astype(np.float32)
+        audio = np.ascontiguousarray(audio)
+        channels = audio.shape[1] if audio.ndim > 1 else 1
+        self._ensure_stream(sample_rate, channels, audio.dtype.name)
+        self.stream.write(audio)
+
+    def finish(self):
+        if self.stream is not None and self.started:
+            self.stream.stop()
+            self.started = False
+
+    def close(self):
+        if self.stream is not None:
+            self.stream.close()
+            self.stream = None
+            self.stream_format = None
+            self.started = False
+
+
 def play_audio_sync(samples, sample_rate):
     sd.play(samples, sample_rate, device=SELECTED_OUTPUT_DEVICE)
     sd.wait()
@@ -601,8 +647,9 @@ async def tts_chunk_worker():
             while True:
                 match = delimiters.search(sentence_buffer)
                 if not match:
+                    chunk_word_limit = FIRST_TTS_WORDS if is_first_chunk else NEXT_TTS_WORDS
                     soft_match = soft_delimiters.search(sentence_buffer)
-                    if soft_match and len(sentence_buffer[:soft_match.end()].split()) >= FIRST_TTS_WORDS:
+                    if soft_match and len(sentence_buffer[:soft_match.end()].split()) >= chunk_word_limit:
                         end_idx = soft_match.end()
                         sentence = sentence_buffer[:end_idx].strip()
                         sentence_buffer = sentence_buffer[end_idx:]
@@ -617,7 +664,6 @@ async def tts_chunk_worker():
                         continue
 
                     # İlk ses çıkışını hızlandırmak için ilk cümlecik erken ateşlenir.
-                    chunk_word_limit = FIRST_TTS_WORDS if is_first_chunk else NEXT_TTS_WORDS
                     if len(sentence_buffer.split()) >= chunk_word_limit:
                         words = sentence_buffer.split()
                         first_part = " ".join(words[:chunk_word_limit]).strip()
@@ -685,6 +731,7 @@ async def audio_player_worker():
     next_sequence_id = 0
     pending_audio = {}
     turn_end_markers = {}
+    audio_player = ContinuousAudioPlayer()
 
     while True:
         item = await audio_queue.get()
@@ -702,7 +749,7 @@ async def audio_player_worker():
                 perf_metrics["first_audio_played"] = time.perf_counter()
 
             try:
-                await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+                await asyncio.to_thread(audio_player.play, samples, sample_rate)
             except Exception as e:
                 print(f"❌ Audio play error: {e}")
 
@@ -710,6 +757,11 @@ async def audio_player_worker():
 
         expected_sequences = turn_end_markers.get(current_turn_id)
         if expected_sequences is not None and next_sequence_id >= expected_sequences:
+            try:
+                await asyncio.to_thread(audio_player.finish)
+            except Exception as e:
+                print(f"❌ Audio finish error: {e}")
+
             rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
             wait_time = (
                 perf_metrics["speech_start"] - perf_metrics["rec_start"]
