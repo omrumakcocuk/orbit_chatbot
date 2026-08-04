@@ -18,6 +18,11 @@ from kokoro_onnx import Kokoro
 from piper import PiperVoice
 from piper.config import SynthesisConfig
 
+try:
+    import sherpa_onnx
+except ModuleNotFoundError:
+    sherpa_onnx = None
+
 load_dotenv()
 warnings.filterwarnings("ignore")
 
@@ -62,6 +67,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
+STT_ENGINE = os.environ.get("STT_ENGINE", "sherpa").strip().lower()
 WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
 WHISPER_TRANSCRIBE_OPTIONS = {
     "beam_size": 1,
@@ -72,6 +78,9 @@ WHISPER_TRANSCRIBE_OPTIONS = {
     "condition_on_previous_text": False,
     "temperature": 0.0,
 }
+SHERPA_SAMPLE_RATE = WHISPER_SAMPLE_RATE
+SHERPA_TOKENS = os.environ.get("SHERPA_TOKENS", "").strip()
+SHERPA_PARAFORMER = os.environ.get("SHERPA_PARAFORMER", "").strip()
 
 LLM_MAX_TOKENS = 96
 LLM_TEMPERATURE = 0.3
@@ -414,6 +423,21 @@ def record_audio_sync(fs, channels):
         return None
 
 def transcribe_audio_sync(stt_model, audio_data):
+    if STT_ENGINE == "sherpa":
+        try:
+            stream = stt_model.create_stream()
+            stream.accept_waveform(SHERPA_SAMPLE_RATE, audio_data)
+            stt_model.decode_stream(stream)
+            result = getattr(stream, "result", "")
+            if hasattr(result, "text"):
+                result = result.text
+            text = str(result).strip()
+            print(f"🔎 STT raw: {text or '[empty]'}")
+            return text
+        except Exception as e:
+            print(f"❌ sherpa-onnx transcription error: {e}", flush=True)
+            return ""
+
     try:
         segments, _ = stt_model.transcribe(
             audio_data,
@@ -457,6 +481,15 @@ def transcribe_audio_sync(stt_model, audio_data):
 
 
 def warmup_stt_model(stt_model):
+    if STT_ENGINE == "sherpa":
+        print("Warming up sherpa-onnx model...")
+        silence = np.zeros(SHERPA_SAMPLE_RATE, dtype=np.float32)
+        stream = stt_model.create_stream()
+        stream.accept_waveform(SHERPA_SAMPLE_RATE, silence)
+        stt_model.decode_stream(stream)
+        print("✅ sherpa-onnx model ready.")
+        return
+
     print("Warming up Whisper model...")
     silence = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
     segments, _ = stt_model.transcribe(
@@ -465,6 +498,36 @@ def warmup_stt_model(stt_model):
     )
     list(segments)
     print("✅ Whisper model ready.")
+
+
+def load_stt_model():
+    if STT_ENGINE == "whisper":
+        return WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=WHISPER_THREADS,
+        )
+
+    if STT_ENGINE == "sherpa":
+        if sherpa_onnx is None:
+            raise RuntimeError("sherpa_onnx is not installed")
+        if not SHERPA_PARAFORMER or not SHERPA_TOKENS:
+            raise RuntimeError(
+                "Set SHERPA_PARAFORMER and SHERPA_TOKENS to use STT_ENGINE=sherpa"
+            )
+        return sherpa_onnx.OfflineRecognizer.from_paraformer(
+            paraformer=SHERPA_PARAFORMER,
+            tokens=SHERPA_TOKENS,
+            num_threads=TOTAL_LOGICAL_CORES,
+            sample_rate=SHERPA_SAMPLE_RATE,
+            feature_dim=80,
+            decoding_method="greedy_search",
+            debug=False,
+            provider="cpu",
+        )
+
+    raise RuntimeError(f"Unsupported STT_ENGINE: {STT_ENGINE}. Use 'whisper' or 'sherpa'.")
 
 def remove_emojis(text):
     emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\u2300-\u23FF]|[\u2B50-\u2B55]', flags=re.UNICODE)
@@ -875,7 +938,10 @@ async def main():
     global MIC_START_THRESHOLD, MIC_STOP_THRESHOLD
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
 
-    print(f"\n🚀 Perfect English Chatbot Started ({TTS_ENGINE.title()} TTS & Google Gemini API).")
+    print(
+        f"\n🚀 Perfect English Chatbot Started "
+        f"({TTS_ENGINE.title()} TTS, {STT_ENGINE.title()} STT & Google Gemini API)."
+    )
     await asyncio.to_thread(load_tts_model)
     await warmup_llm()
 
@@ -883,12 +949,7 @@ async def main():
         print("⌨️ Text mode enabled. Type your message and press Enter.")
         asyncio.create_task(text_input_worker())
     else:
-        stt_model = WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=WHISPER_THREADS,
-        )
+        stt_model = await asyncio.to_thread(load_stt_model)
         await asyncio.to_thread(warmup_stt_model, stt_model)
         try:
             MIC_START_THRESHOLD, MIC_STOP_THRESHOLD = await asyncio.to_thread(

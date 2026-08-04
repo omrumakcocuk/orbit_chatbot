@@ -1,6 +1,7 @@
 numpy
 sounddevice
 faster-whisper
+sherpa-onnx
 google-genai
 kokoro-onnx
 piper-tts
