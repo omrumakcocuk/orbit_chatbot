@@ -745,8 +745,12 @@ async def audio_player_worker():
 
         while (current_turn_id, next_sequence_id) in pending_audio:
             samples, sample_rate = pending_audio.pop((current_turn_id, next_sequence_id))
+            play_requested_at = time.perf_counter()
             if perf_metrics["first_audio_played"] == 0.0:
-                perf_metrics["first_audio_played"] = time.perf_counter()
+                perf_metrics["first_audio_played"] = play_requested_at
+            elif next_sequence_id == 1:
+                second_audio_delay = play_requested_at - perf_metrics["first_audio_played"]
+                print(f"⏱️ Second audio: {second_audio_delay:.2f}s after first")
 
             try:
                 await asyncio.to_thread(audio_player.play, samples, sample_rate)
