@@ -1,18 +1,17 @@
 import os
-import queue
 import wave
 
 import numpy as np
-import sounddevice as sd
+import pyaudio
 
 
-INPUT_SAMPLE_RATE = 48000
-TARGET_SAMPLE_RATE = 16000
+INPUT_SAMPLE_RATE = 16000
 CHANNELS = 2
-BLOCK_DURATION = 0.05
-RECORD_SECONDS = 10
-RAW_OUTPUT_WAV = "debug_capture_48k.wav"
-DOWNSAMPLED_OUTPUT_WAV = "debug_capture_16k.wav"
+MIC_FORMAT = pyaudio.paInt16
+MIC_CHUNK = 1024
+MIC_GAIN = float(os.environ.get("MIC_GAIN", "15.0"))
+RECORD_SECONDS = 5
+OUTPUT_WAV = "debug_capture_bot_mic.wav"
 
 
 def parse_device_index(value):
@@ -24,44 +23,28 @@ def parse_device_index(value):
         return value
 
 
-def resolve_input_device():
+def resolve_pulse_input_device(pya):
     requested_device = parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
-    default_input, _default_output = sd.default.device
-    input_device = requested_device if requested_device is not None else default_input
+    if requested_device is not None:
+        info = pya.get_device_info_by_index(requested_device)
+        print("Audio device selection:")
+        print(f"  Input : {requested_device} -> {info['name']}")
+        return requested_device
+
+    pulse_index = None
+    for index in range(pya.get_device_count()):
+        info = pya.get_device_info_by_index(index)
+        if "pulse" in info["name"].lower() and info["maxInputChannels"] > 0:
+            pulse_index = index
+            break
 
     print("Audio device selection:")
-    if input_device is None:
+    if pulse_index is None:
         print("  Input : none")
-        return None
-
-    input_info = sd.query_devices(input_device, "input")
-    print(f"  Input : {input_device} -> {input_info['name']}")
-    return input_device
-
-
-def downsample_audio(audio_data, source_rate, target_rate):
-    if source_rate == target_rate or len(audio_data) == 0:
-        return audio_data.astype(np.float32, copy=False)
-
-    duration = len(audio_data) / float(source_rate)
-    target_length = max(1, int(duration * target_rate))
-    print(
-        "🔄 Downsampling audio:",
-        f"samples={len(audio_data)} @ {source_rate} Hz",
-        f"-> target_samples={target_length} @ {target_rate} Hz",
-    )
-    print(
-        f"   duration={duration:.3f}s, ratio={source_rate / float(target_rate):.2f}:1"
-    )
-    source_positions = np.linspace(0, len(audio_data) - 1, num=len(audio_data), dtype=np.float32)
-    target_positions = np.linspace(0, len(audio_data) - 1, num=target_length, dtype=np.float32)
-    downsampled = np.interp(target_positions, source_positions, audio_data).astype(np.float32)
-    print(
-        "✅ Downsampling complete:",
-        f"output_samples={len(downsampled)}",
-        f"output_duration={len(downsampled) / float(target_rate):.3f}s",
-    )
-    return downsampled
+    else:
+        info = pya.get_device_info_by_index(pulse_index)
+        print(f"  Input : {pulse_index} -> {info['name']}")
+    return pulse_index
 
 
 def save_wav(path, audio_data, sample_rate):
@@ -74,67 +57,63 @@ def save_wav(path, audio_data, sample_rate):
         wav_file.writeframes(pcm16.tobytes())
 
 
-def record_fixed_duration(fs, channels, seconds, input_device):
-    block_size = int(fs * BLOCK_DURATION)
-    total_blocks = int(seconds / BLOCK_DURATION)
-    audio_blocks = queue.Queue()
-    recorded_frames = []
+def record_fixed_duration():
+    pya = pyaudio.PyAudio()
+    input_device = resolve_pulse_input_device(pya)
+    if input_device is None:
+        pya.terminate()
+        raise RuntimeError("No Pulse input device found")
 
-    def audio_callback(indata, _frames, _callback_time, status):
-        if status:
-            print(f"⚠️ Audio callback status: {status}", flush=True)
-        audio_blocks.put(indata.copy())
+    total_chunks = max(1, int((INPUT_SAMPLE_RATE * RECORD_SECONDS) / MIC_CHUNK))
+    frames = []
 
-    print(f"🎙️ Recording {seconds} seconds at {fs} Hz...")
-    with sd.InputStream(
-        samplerate=fs,
-        channels=channels,
-        dtype="int16",
-        blocksize=block_size,
-        device=input_device,
-        callback=audio_callback,
-    ):
-        for _ in range(total_blocks):
-            data = audio_blocks.get()
-            audio_block = data.astype(np.float32)
-            if audio_block.ndim == 1:
-                audio_block = audio_block[:, None]
+    print(
+        f"🎙️ Recording {RECORD_SECONDS} seconds "
+        f"at {INPUT_SAMPLE_RATE} Hz, gain={MIC_GAIN}..."
+    )
 
-            channel_rms = np.sqrt(np.mean(np.square(audio_block), axis=0))
-            active_channel = int(np.argmax(channel_rms))
-            mono_block = audio_block[:, active_channel]
-            recorded_frames.append(mono_block)
+    stream = pya.open(
+        format=MIC_FORMAT,
+        channels=CHANNELS,
+        rate=INPUT_SAMPLE_RATE,
+        input=True,
+        input_device_index=input_device,
+        frames_per_buffer=MIC_CHUNK,
+    )
 
-    if not recorded_frames:
+    try:
+        for _ in range(total_chunks):
+            data = stream.read(MIC_CHUNK, exception_on_overflow=False)
+            samples = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
+            samples = np.clip(samples * MIC_GAIN, -32768.0, 32767.0)
+            frames.append(samples)
+    finally:
+        stream.stop_stream()
+        stream.close()
+        pya.terminate()
+
+    if not frames:
         raise RuntimeError("No audio was captured")
 
-    recording = np.concatenate(recorded_frames, axis=0)
-    return recording.flatten().astype(np.float32) / 32768.0
+    recording = np.concatenate(frames, axis=0)
+    return recording.astype(np.float32) / 32768.0
 
 
 def main():
-    input_device = resolve_input_device()
-    if input_device is None:
-        raise RuntimeError("No input device available")
+    mono_audio = record_fixed_duration()
+    duration = len(mono_audio) / float(INPUT_SAMPLE_RATE)
+    rms = float(np.sqrt(np.mean(np.square(mono_audio)))) if len(mono_audio) else 0.0
 
-    mono_48k = record_fixed_duration(
-        INPUT_SAMPLE_RATE,
-        CHANNELS,
-        RECORD_SECONDS,
-        input_device,
-    )
     print(
         "📦 Captured mono audio:",
-        f"samples={len(mono_48k)}",
-        f"duration={len(mono_48k) / float(INPUT_SAMPLE_RATE):.3f}s",
+        f"samples={len(mono_audio)}",
+        f"duration={duration:.3f}s",
+        f"rms={rms:.4f}",
     )
-    mono_16k = downsample_audio(mono_48k, INPUT_SAMPLE_RATE, TARGET_SAMPLE_RATE)
 
-    save_wav(RAW_OUTPUT_WAV, mono_48k, INPUT_SAMPLE_RATE)
-    save_wav(DOWNSAMPLED_OUTPUT_WAV, mono_16k, TARGET_SAMPLE_RATE)
-
-    print(f"✅ Saved 48 kHz mono capture to {RAW_OUTPUT_WAV}")
-    print(f"✅ Saved 16 kHz mono capture to {DOWNSAMPLED_OUTPUT_WAV}")
+    save_wav(OUTPUT_WAV, mono_audio, INPUT_SAMPLE_RATE)
+    print(f"✅ Saved capture to {OUTPUT_WAV}")
+    print(f"▶️ Play it with: aplay {OUTPUT_WAV}")
 
 
 if __name__ == "__main__":
