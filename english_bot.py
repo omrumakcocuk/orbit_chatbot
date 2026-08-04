@@ -72,6 +72,7 @@ LLM_MAX_TOKENS = 96
 LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
 FIRST_TTS_WORDS = 5
+NEXT_TTS_WORDS = 8
 TTS_WORKER_COUNT = 2
 
 perf_metrics = {}
@@ -573,6 +574,7 @@ async def llm_worker():
 async def tts_chunk_worker():
     sentence_buffer = ""
     delimiters = re.compile(r'([.?!\n]+)')
+    soft_delimiters = re.compile(r'([,;:]+)')
     is_first_chunk = True
     playback_sequence = 0
     playback_turn_id = 0
@@ -599,11 +601,27 @@ async def tts_chunk_worker():
             while True:
                 match = delimiters.search(sentence_buffer)
                 if not match:
+                    soft_match = soft_delimiters.search(sentence_buffer)
+                    if soft_match and len(sentence_buffer[:soft_match.end()].split()) >= FIRST_TTS_WORDS:
+                        end_idx = soft_match.end()
+                        sentence = sentence_buffer[:end_idx].strip()
+                        sentence_buffer = sentence_buffer[end_idx:]
+
+                        clean_sent = clean_text_for_tts(sentence)
+                        if any(c.isalnum() for c in clean_sent):
+                            if perf_metrics["first_tts_chunk_queued"] == 0.0:
+                                perf_metrics["first_tts_chunk_queued"] = time.perf_counter()
+                            await playback_queue.put((playback_turn_id, playback_sequence, clean_sent))
+                            playback_sequence += 1
+                            is_first_chunk = False
+                        continue
+
                     # İlk ses çıkışını hızlandırmak için ilk cümlecik erken ateşlenir.
-                    if is_first_chunk and len(sentence_buffer.split()) >= FIRST_TTS_WORDS:
+                    chunk_word_limit = FIRST_TTS_WORDS if is_first_chunk else NEXT_TTS_WORDS
+                    if len(sentence_buffer.split()) >= chunk_word_limit:
                         words = sentence_buffer.split()
-                        first_part = " ".join(words[:FIRST_TTS_WORDS]).strip()
-                        sentence_buffer = " ".join(words[FIRST_TTS_WORDS:]).strip()
+                        first_part = " ".join(words[:chunk_word_limit]).strip()
+                        sentence_buffer = " ".join(words[chunk_word_limit:]).strip()
                         if sentence_buffer:
                             sentence_buffer = " " + sentence_buffer
                         
