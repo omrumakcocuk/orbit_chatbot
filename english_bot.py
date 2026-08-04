@@ -67,7 +67,7 @@ WHISPER_TRANSCRIBE_OPTIONS = {
     "beam_size": 1,
     "best_of": 1,
     "language": "en",
-    "vad_filter": False,
+    "vad_filter": True,
     "without_timestamps": True,
     "condition_on_previous_text": False,
     "temperature": 0.0,
