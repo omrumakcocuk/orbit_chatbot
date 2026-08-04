@@ -1,4 +1,5 @@
 numpy
+pyaudio
 sounddevice
 faster-whisper
 sherpa-onnx

@@ -9,6 +9,7 @@ import time
 import warnings
 
 import numpy as np
+import pyaudio
 import sounddevice as sd
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
@@ -43,6 +44,8 @@ INPUT_SAMPLE_RATE = 16000
 WHISPER_SAMPLE_RATE = 16000
 CHANNELS = 2
 MIC_GAIN = float(os.environ.get("MIC_GAIN", "25.0"))
+MIC_FORMAT = pyaudio.paInt16
+MIC_CHUNK = 1024
 SPEECH_THRESHOLD = 400
 SPEECH_THRESHOLD_FACTOR = 1.55
 CALIBRATION_DURATION = 0.3
@@ -328,7 +331,7 @@ def create_tts_audio(text, speed=TTS_SPEECH_SPEED):
     )
 
 def record_audio_sync(fs, channels):
-    block_size = int(fs * BLOCK_DURATION)
+    pya = pyaudio.PyAudio()
     recorded_frames = []
     start_time = time.perf_counter()
     speech_started = False
@@ -337,25 +340,21 @@ def record_audio_sync(fs, channels):
 
     pre_speech_buffer_size = int(0.35 / BLOCK_DURATION)
     pre_speech_blocks = collections.deque(maxlen=pre_speech_buffer_size)
-    audio_blocks = queue.Queue()
     start_threshold = MIC_START_THRESHOLD
     stop_threshold = MIC_STOP_THRESHOLD
+    input_device = SELECTED_INPUT_DEVICE
 
-    def audio_callback(indata, _frames, _callback_time, status):
-        if status:
-            print(f"⚠️ Audio callback status: {status}", flush=True)
-        audio_blocks.put(indata.copy())
-    
     try:
         print(f"🎚️ Record config -> fs={fs}, channels={channels}", flush=True)
-        with sd.InputStream(
-            samplerate=fs,
+        stream = pya.open(
+            format=MIC_FORMAT,
             channels=channels,
-            dtype='int16',
-            blocksize=block_size,
-            device=SELECTED_INPUT_DEVICE,
-            callback=audio_callback,
-        ):
+            rate=fs,
+            input=True,
+            input_device_index=input_device,
+            frames_per_buffer=MIC_CHUNK,
+        )
+        try:
             while True:
                 current_time = time.perf_counter()
                 elapsed_total = current_time - start_time
@@ -364,15 +363,12 @@ def record_audio_sync(fs, channels):
                     break
 
                 try:
-                    data = audio_blocks.get(timeout=max(BLOCK_DURATION * 2, 0.1))
-                except queue.Empty:
+                    data = stream.read(MIC_CHUNK, exception_on_overflow=False)
+                except Exception as e:
+                    print(f"⚠️ Audio read error: {e}", flush=True)
                     continue
 
-                audio_block = data.astype(np.float32)
-                if audio_block.ndim == 1:
-                    audio_block = audio_block[:, None]
-
-                mono_block = audio_block[:, 0]
+                mono_block = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
                 mono_block = np.clip(mono_block * MIC_GAIN, -32768.0, 32767.0)
                 rms = float(np.sqrt(np.mean(np.square(mono_block))))
 
@@ -403,6 +399,9 @@ def record_audio_sync(fs, channels):
                         and silence_time >= SILENCE_DURATION
                     ):
                         break
+        finally:
+            stream.stop_stream()
+            stream.close()
                             
         if not speech_started:
             if (time.perf_counter() - start_time) > WAIT_FOR_SPEECH_TIMEOUT:
@@ -421,6 +420,8 @@ def record_audio_sync(fs, channels):
     except Exception as e:
         print(f"⚠️ Microphone open/read error: {e}", flush=True)
         return None
+    finally:
+        pya.terminate()
 
 def transcribe_audio_sync(stt_model, audio_data):
     if STT_ENGINE == "sherpa":
