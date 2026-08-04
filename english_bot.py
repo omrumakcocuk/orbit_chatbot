@@ -62,7 +62,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base.en")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
 WHISPER_TRANSCRIBE_OPTIONS = {
     "beam_size": 1,
     "best_of": 1,
