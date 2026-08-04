@@ -1,5 +1,7 @@
 import os
+import time
 import wave
+from collections import deque
 
 import numpy as np
 import pyaudio
@@ -10,7 +12,11 @@ CHANNELS = 2
 MIC_FORMAT = pyaudio.paInt16
 MIC_CHUNK = 1024
 MIC_GAIN = float(os.environ.get("MIC_GAIN", "15.0"))
-RECORD_SECONDS = 5
+SPEECH_THRESHOLD = float(os.environ.get("SPEECH_THRESHOLD", "400"))
+SILENCE_DURATION = float(os.environ.get("SILENCE_DURATION", "0.6"))
+WAIT_FOR_SPEECH_TIMEOUT = float(os.environ.get("WAIT_FOR_SPEECH_TIMEOUT", "10.0"))
+RECORDING_SAFETY_TIMEOUT = float(os.environ.get("RECORDING_SAFETY_TIMEOUT", "60.0"))
+PRE_SPEECH_DURATION = 0.35
 OUTPUT_WAV = "debug_capture_bot_mic.wav"
 
 
@@ -57,20 +63,29 @@ def save_wav(path, audio_data, sample_rate):
         wav_file.writeframes(pcm16.tobytes())
 
 
-def record_fixed_duration():
+def record_until_silence():
     pya = pyaudio.PyAudio()
     input_device = resolve_pulse_input_device(pya)
     if input_device is None:
         pya.terminate()
         raise RuntimeError("No Pulse input device found")
 
-    total_chunks = max(1, int((INPUT_SAMPLE_RATE * RECORD_SECONDS) / MIC_CHUNK))
     frames = []
+    chunk_duration = MIC_CHUNK / float(INPUT_SAMPLE_RATE)
+    pre_speech_chunks = deque(
+        maxlen=max(1, int(PRE_SPEECH_DURATION / chunk_duration))
+    )
+    speech_started = False
+    listening_started_at = time.monotonic()
+    speech_started_at = None
+    silence_time = 0.0
+    stop_threshold = SPEECH_THRESHOLD * 0.8
 
     print(
-        f"🎙️ Recording {RECORD_SECONDS} seconds "
-        f"at {INPUT_SAMPLE_RATE} Hz, gain={MIC_GAIN}..."
+        f"🎙️ Waiting for speech at {INPUT_SAMPLE_RATE} Hz, gain={MIC_GAIN}, "
+        f"threshold={SPEECH_THRESHOLD:.0f}..."
     )
+    print(f"Recording will stop after {SILENCE_DURATION:.1f}s of silence.")
 
     stream = pya.open(
         format=MIC_FORMAT,
@@ -82,11 +97,40 @@ def record_fixed_duration():
     )
 
     try:
-        for _ in range(total_chunks):
+        while True:
             data = stream.read(MIC_CHUNK, exception_on_overflow=False)
             samples = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
             samples = np.clip(samples * MIC_GAIN, -32768.0, 32767.0)
+            rms = float(np.sqrt(np.mean(np.square(samples))))
+            now = time.monotonic()
+
+            if not speech_started:
+                pre_speech_chunks.append(samples)
+                if rms > SPEECH_THRESHOLD:
+                    speech_started = True
+                    speech_started_at = now
+                    frames.extend(pre_speech_chunks)
+                    pre_speech_chunks.clear()
+                    print(f"✅ Speech detected (RMS={rms:.1f}). Speak now...")
+                elif now - listening_started_at >= WAIT_FOR_SPEECH_TIMEOUT:
+                    raise RuntimeError(
+                        f"No speech detected within {WAIT_FOR_SPEECH_TIMEOUT:.1f} seconds"
+                    )
+                continue
+
             frames.append(samples)
+            if rms > stop_threshold:
+                silence_time = 0.0
+            else:
+                silence_time += chunk_duration
+
+            speech_duration = now - speech_started_at
+            if silence_time >= SILENCE_DURATION:
+                print(f"🛑 Speech ended ({silence_time:.1f}s silence detected).")
+                break
+            if speech_duration >= RECORDING_SAFETY_TIMEOUT:
+                print("⚠️ Recording safety timeout reached.")
+                break
     finally:
         stream.stop_stream()
         stream.close()
@@ -100,7 +144,7 @@ def record_fixed_duration():
 
 
 def main():
-    mono_audio = record_fixed_duration()
+    mono_audio = record_until_silence()
     duration = len(mono_audio) / float(INPUT_SAMPLE_RATE)
     rms = float(np.sqrt(np.mean(np.square(mono_audio)))) if len(mono_audio) else 0.0
 
