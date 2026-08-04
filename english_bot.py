@@ -40,9 +40,8 @@ CHANNELS = 2
 SPEECH_THRESHOLD = 400
 SPEECH_THRESHOLD_FACTOR = 1.55
 CALIBRATION_DURATION = 0.3
-SILENCE_DURATION = 0.35
+SILENCE_DURATION = 0.6
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
-MAX_SPEECH_DURATION = 8.0
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.15
 MIN_RECORDING_AFTER_SPEECH_START = 0.15
@@ -61,7 +60,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base.en")
 WHISPER_TRANSCRIBE_OPTIONS = {
     "beam_size": 1,
     "best_of": 1,
@@ -250,7 +249,7 @@ def load_tts_model():
     raise RuntimeError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}. Use 'piper' or 'kokoro'.")
 
 
-def create_tts_audio(text, speed=1.20):
+def create_tts_audio(text, speed=1.45):
     if TTS_ENGINE == "piper":
         if piper_tts is None:
             raise RuntimeError("Piper TTS is not loaded")
@@ -365,9 +364,6 @@ def record_audio_sync(fs, channels):
                         silence_time += BLOCK_DURATION
 
                     speech_duration = current_time - first_speech_block_time
-                    if speech_duration >= MAX_SPEECH_DURATION:
-                        print("⏱️ Maximum recording duration reached; transcribing.", flush=True)
-                        break
                     if (
                         speech_duration > MIN_RECORDING_AFTER_SPEECH_START
                         and silence_time >= SILENCE_DURATION
@@ -531,7 +527,7 @@ async def say_farewell(user_text=None):
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             ACTIVE_FAREWELL_TEXT,
-            1.15,
+            1.45,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
     except Exception as e:
@@ -756,7 +752,7 @@ async def tts_generator_worker():
                     perf_metrics["tts_first_start"] = time.perf_counter()
                 async with tts_lock:
                     samples, sample_rate = await asyncio.to_thread(
-                        create_tts_audio, sentence, 1.3
+                        create_tts_audio, sentence, 1.45
                     )
                 if perf_metrics["tts_first_ready"] == 0.0:
                     perf_metrics["tts_first_ready"] = time.perf_counter()
@@ -787,12 +783,8 @@ async def audio_player_worker():
 
         while (current_turn_id, next_sequence_id) in pending_audio:
             samples, sample_rate = pending_audio.pop((current_turn_id, next_sequence_id))
-            play_requested_at = time.perf_counter()
             if perf_metrics["first_audio_played"] == 0.0:
-                perf_metrics["first_audio_played"] = play_requested_at
-            elif next_sequence_id == 1:
-                second_audio_delay = play_requested_at - perf_metrics["first_audio_played"]
-                print(f"⏱️ Second audio: {second_audio_delay:.2f}s after first")
+                perf_metrics["first_audio_played"] = time.perf_counter()
 
             try:
                 await asyncio.to_thread(audio_player.play, samples, sample_rate)
@@ -881,7 +873,7 @@ async def main():
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             intro_text,
-            1.15,
+            1.45,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         
