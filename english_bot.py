@@ -1,51 +1,25 @@
-import sys
-LIST_AUDIO_DEVICES_ONLY = "--list-audio-devices" in sys.argv
-TEXT_MODE_ONLY = "--text-mode" in sys.argv
-
-if LIST_AUDIO_DEVICES_ONLY:
-    import sounddevice as sd
-
-    try:
-        devices = sd.query_devices()
-        default_input, default_output = sd.default.device
-        print("\nAvailable audio devices:")
-        for index, device in enumerate(devices):
-            flags = []
-            if device["max_input_channels"] > 0:
-                flags.append("input")
-            if device["max_output_channels"] > 0:
-                flags.append("output")
-            if index == default_input:
-                flags.append("default-in")
-            if index == default_output:
-                flags.append("default-out")
-            print(f"  [{index}] {device['name']} ({', '.join(flags) or 'n/a'})")
-    except Exception as e:
-        print(f"⚠️ Could not list audio devices: {e}")
-    raise SystemExit(0)
-
-import os
-import re
-import time
 import asyncio
 import collections
+import os
 import queue
-from google import genai
-from google.genai import types
 import random
-from kokoro_onnx import Kokoro
-from dotenv import load_dotenv
-
-load_dotenv()  # .env dosyasındaki ortam değişkenlerini sisteme yükler
+import re
+import sys
+import time
+import warnings
 
 import numpy as np
 import sounddevice as sd
-
-# pyrefly: ignore [missing-import]
+from dotenv import load_dotenv
 from faster_whisper import WhisperModel
-import warnings
+from google import genai
+from google.genai import types
+from kokoro_onnx import Kokoro
+
+load_dotenv()
 warnings.filterwarnings("ignore")
 
+TEXT_MODE_ONLY = "--text-mode" in sys.argv
 
 def _parse_device_index(value):
     if value is None or value == "":
@@ -55,66 +29,56 @@ def _parse_device_index(value):
     except ValueError:
         return value
 
-# --- DİNAMİK OTOMATİK ÇEKİRDEK AYARI ---
 TOTAL_LOGICAL_CORES = os.cpu_count() or 4
-LLM_THREADS = max(1, int(TOTAL_LOGICAL_CORES * 0.75))
-WHISPER_THREADS = max(1, TOTAL_LOGICAL_CORES - 1)
+WHISPER_THREADS = TOTAL_LOGICAL_CORES
 
-# --- YAPILANDIRMA (Hızlı Kesme Odaklı) ---
 INPUT_SAMPLE_RATE = 48000
 WHISPER_SAMPLE_RATE = 16000
 CHANNELS = 2
-SPEECH_THRESHOLD = 60
+SPEECH_THRESHOLD = 200
 SPEECH_THRESHOLD_FACTOR = 1.55
-START_BLOCK_COUNT = 2
-CALIBRATION_DURATION = 0.5
-SILENCE_DURATION = 0.65
+CALIBRATION_DURATION = 0.3
+SILENCE_DURATION = 0.35
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
 MAX_SPEECH_DURATION = 8.0
 BLOCK_DURATION = 0.05
-MIN_SPEECH_DURATION = 0.2
-MIN_RECORDING_AFTER_SPEECH_START = 0.3
+MIN_SPEECH_DURATION = 0.15
+MIN_RECORDING_AFTER_SPEECH_START = 0.15
 INPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
 OUTPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_OUTPUT_DEVICE"))
 SELECTED_INPUT_DEVICE = INPUT_DEVICE
 SELECTED_OUTPUT_DEVICE = OUTPUT_DEVICE
 
-# İNGİLİZCE MODELLER
 KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
 KOKORO_VOICES = "voices/voices-v1.0.bin"
-
 kokoro_tts = None
-if not LIST_AUDIO_DEVICES_ONLY:
-    try:
-        print("Loading Kokoro TTS model...")
-        kokoro_tts = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
-        print("✅ Kokoro TTS loaded.")
-    except Exception as e:
-        print(f"⚠️ Failed to load Kokoro TTS: {e}")
-        kokoro_tts = None
-
-# --- GOOGLE AI STUDIO (GEMINI API) AYARLARI ---
-# API anahtarınız otomatik olarak .env dosyasından veya sistem değişkenlerinden yüklenir:
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
-if not LIST_AUDIO_DEVICES_ONLY and GEMINI_API_KEY:
-    gemini_client = genai.Client(api_key=GEMINI_API_KEY)
-elif not LIST_AUDIO_DEVICES_ONLY:
-    print("⚠️ UYARI: GEMINI_API_KEY bulunamadı! Lütfen .env dosyasına GEMINI_API_KEY=... ekleyin.")
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-WHISPER_MODEL_SIZE = "base"
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
+WHISPER_TRANSCRIBE_OPTIONS = {
+    "beam_size": 1,
+    "best_of": 1,
+    "language": "en",
+    "vad_filter": False,
+    "without_timestamps": True,
+    "condition_on_previous_text": False,
+    "temperature": 0.0,
+}
 
-LLM_CONTEXT_SIZE = 1024
-LLM_MAX_TOKENS = 80
+LLM_MAX_TOKENS = 96
 LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
-FIRST_TTS_WORDS = 2
+FIRST_TTS_WORDS = 5
 TTS_WORKER_COUNT = 2
 
 perf_metrics = {}
 conversation_history = []
 user_has_spoken = True
+EXIT_COMMANDS = {
+    "bye", "goodbye", "good bye", "bye bye", "see you", "exit", "stop", "quit"
+}
 
 # --- RASTGELE SESLİ ASİSTAN SEÇİMİ ---
 # Program her açıldığında aşağıdaki asistanlardan biri seçilir.
@@ -133,7 +97,8 @@ VOICE_OPTIONS = [
         "system_prompt": (
             "You are Adam, a friendly, natural and confident American male "
             "English conversation partner. Always reply in English. "
-            "Keep your answers short and conversational."
+            "Answer in one or two short, complete, conversational sentences. "
+            "Never stop mid-sentence."
         ),
     },
     {
@@ -149,7 +114,8 @@ VOICE_OPTIONS = [
         "system_prompt": (
             "You are Heart, a warm, friendly and helpful American female "
             "English conversation partner. Always reply in English. "
-            "Keep your answers short and conversational."
+            "Answer in one or two short, complete, conversational sentences. "
+            "Never stop mid-sentence."
         ),
     },
 ]
@@ -165,19 +131,15 @@ def reset_metrics():
     global perf_metrics
     perf_metrics = {
         "rec_start": 0.0,
+        "speech_start": 0.0,
         "rec_end": 0.0,
         "stt_start": 0.0,
         "stt_end": 0.0,
         "llm_start": 0.0,
         "llm_first_token": 0.0,
         "llm_end": 0.0,
-        "tts_total": 0.0,
         "first_audio_played": 0.0
     }
-
-def setup_directories():
-    os.makedirs("voices", exist_ok=True)
-
 
 def print_audio_devices():
     try:
@@ -201,7 +163,6 @@ def print_audio_devices():
 
 def resolve_audio_devices():
     try:
-        devices = sd.query_devices()
         default_input, default_output = sd.default.device
         input_device = INPUT_DEVICE if INPUT_DEVICE is not None else default_input
         output_device = OUTPUT_DEVICE if OUTPUT_DEVICE is not None else default_output
@@ -239,31 +200,35 @@ def downsample_audio(audio_data, source_rate, target_rate):
 async def warmup_llm():
     global gemini_client
     print("Checking Gemini API configuration...")
-    if not GEMINI_API_KEY and not os.environ.get("GEMINI_API_KEY"):
-        print("⚠️ UYARI: Google AI Studio için GEMINI_API_KEY bulunamadı! Lütfen .env dosyanızda tanımlı olduğundan emin olun.")
-    else:
-        try:
-            if not gemini_client:
-                gemini_client = genai.Client(api_key=os.environ.get("GEMINI_API_KEY"))
-            await gemini_client.aio.models.generate_content(
-                model=GEMINI_MODEL_NAME,
-                contents="Hi",
-            )
-            print("✅ Gemini API connection tested successfully.")
-        except Exception as e:
-            print(f"⚠️ Gemini API warmup/connection error: {e}")
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is missing from .env")
+
+    try:
+        gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+        await gemini_client.aio.models.generate_content(
+            model=GEMINI_MODEL_NAME,
+            contents="Hi",
+        )
+        print("✅ Gemini API connection tested successfully.")
+    except Exception as e:
+        raise RuntimeError(f"Gemini API connection failed: {e}") from e
+
+
+def load_tts_model():
+    print("Loading Kokoro TTS model...")
+    model = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+    print("✅ Kokoro TTS loaded.")
+    return model
 
 def record_audio_sync(fs, channels):
     block_size = int(fs * BLOCK_DURATION)
     recorded_frames = []
     start_time = time.perf_counter()
     speech_started = False
-    consecutive_high_blocks = 0
-    max_rms = 0.0
     first_speech_block_time = 0.0
     silence_time = 0.0
 
-    pre_speech_buffer_size = int(0.6 / BLOCK_DURATION)
+    pre_speech_buffer_size = int(0.35 / BLOCK_DURATION)
     pre_speech_blocks = collections.deque(maxlen=pre_speech_buffer_size)
     audio_blocks = queue.Queue()
     calibration_blocks = max(1, int(CALIBRATION_DURATION / BLOCK_DURATION))
@@ -271,7 +236,7 @@ def record_audio_sync(fs, channels):
     start_threshold = float(SPEECH_THRESHOLD)
     stop_threshold = float(SPEECH_THRESHOLD)
 
-    def audio_callback(indata, frames, callback_time, status):
+    def audio_callback(indata, _frames, _callback_time, status):
         if status:
             print(f"⚠️ Audio callback status: {status}", flush=True)
         audio_blocks.put(indata.copy())
@@ -285,7 +250,7 @@ def record_audio_sync(fs, channels):
             blocksize=block_size,
             device=SELECTED_INPUT_DEVICE,
             callback=audio_callback,
-        ) as stream:
+        ):
             while True:
                 current_time = time.perf_counter()
                 elapsed_total = current_time - start_time
@@ -319,7 +284,8 @@ def record_audio_sync(fs, channels):
                         )
                         stop_threshold = max(
                             float(SPEECH_THRESHOLD) * 0.8,
-                            noise_floor * 1.20,
+                            noise_floor * 1.35,
+                            start_threshold * 0.72,
                         )
                         print(
                             f"🎚️ Mic ready -> noise={noise_floor:.1f}, "
@@ -328,20 +294,16 @@ def record_audio_sync(fs, channels):
                         )
                     continue
 
-                if rms > max_rms: max_rms = rms
-                    
                 if not speech_started:
                     if rms > start_threshold:
-                        consecutive_high_blocks += 1
                         pre_speech_blocks.append(mono_block)
-                        if consecutive_high_blocks >= START_BLOCK_COUNT:
-                            speech_started = True
-                            print(f"✅ Speech detected (RMS={rms:.1f}).", flush=True)
-                            first_speech_block_time = current_time
-                            recorded_frames.extend(pre_speech_blocks)
-                            pre_speech_blocks.clear()
+                        speech_started = True
+                        print(f"✅ Speech detected (RMS={rms:.1f}).", flush=True)
+                        first_speech_block_time = current_time
+                        perf_metrics["speech_start"] = current_time
+                        recorded_frames.extend(pre_speech_blocks)
+                        pre_speech_blocks.clear()
                     else:
-                        consecutive_high_blocks = 0
                         pre_speech_blocks.append(mono_block)
                 else:
                     recorded_frames.append(mono_block)
@@ -366,8 +328,6 @@ def record_audio_sync(fs, channels):
                 return "TIMEOUT"
             return None
             
-        if max_rms < start_threshold:
-            return None
         if (time.perf_counter() - first_speech_block_time) < MIN_SPEECH_DURATION:
             return None
         
@@ -383,9 +343,8 @@ def record_audio_sync(fs, channels):
 def transcribe_audio_sync(stt_model, audio_data):
     try:
         segments, _ = stt_model.transcribe(
-            audio_data, beam_size=2, language="en", # İNGİLİZCE
-            vad_filter=False, without_timestamps=True,
-            condition_on_previous_text=False, temperature=0.0
+            audio_data,
+            **WHISPER_TRANSCRIBE_OPTIONS,
         )
         segments = list(segments)
         raw_segments = []
@@ -423,6 +382,17 @@ def transcribe_audio_sync(stt_model, audio_data):
         print(f"❌ Whisper transcription error: {e}", flush=True)
         return ""
 
+
+def warmup_stt_model(stt_model):
+    print("Warming up Whisper model...")
+    silence = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
+    segments, _ = stt_model.transcribe(
+        silence,
+        **WHISPER_TRANSCRIBE_OPTIONS,
+    )
+    list(segments)
+    print("✅ Whisper model ready.")
+
 def remove_emojis(text):
     emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\u2300-\u23FF]|[\u2B50-\u2B55]', flags=re.UNICODE)
     return emoji_pattern.sub(r'', text)
@@ -442,16 +412,41 @@ tts_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
 audio_queue = asyncio.Queue() # Bellekte tutulan ses parçaları için kuyruk
 can_listen_event = asyncio.Event()
-playback_sequence = 0
-playback_turn_id = 0
+shutdown_event = asyncio.Event()
 
 def play_audio_sync(samples, sample_rate):
     sd.play(samples, sample_rate, device=SELECTED_OUTPUT_DEVICE)
     sd.wait()
 
+
+def is_exit_command(text):
+    normalized = re.sub(r'[^\w\s]', '', text.lower()).strip()
+    return normalized in EXIT_COMMANDS
+
+
+async def say_farewell(user_text=None):
+    if user_text:
+        print(f"🗣️ You: {user_text}")
+    print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
+
+    try:
+        samples, sample_rate = await asyncio.to_thread(
+            kokoro_tts.create,
+            ACTIVE_FAREWELL_TEXT,
+            voice=ACTIVE_VOICE_ID,
+            speed=1.15,
+            lang="en-us",
+        )
+        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+    except Exception as e:
+        print(f"Farewell playback error: {e}")
+
+    print("\n👋 Assistant shut down cleanly.")
+    shutdown_event.set()
+
+
 async def vad_worker():
     global user_has_spoken
-    consecutive_timeouts = 0  
     while True:
         await can_listen_event.wait()
         
@@ -466,7 +461,6 @@ async def vad_worker():
         perf_metrics["rec_end"] = time.perf_counter()
         
         if isinstance(audio_data, np.ndarray):
-            consecutive_timeouts = 0
             can_listen_event.clear()
             await stt_queue.put(audio_data)
         elif audio_data == "TIMEOUT":
@@ -476,7 +470,6 @@ async def vad_worker():
 
 
 async def text_input_worker():
-    global user_has_spoken
     while True:
         await can_listen_event.wait()
         user_text = await asyncio.to_thread(input, "\n⌨️ You: ")
@@ -484,20 +477,9 @@ async def text_input_worker():
         if not user_text:
             continue
 
-        user_has_spoken = True
-        clean_cmd = re.sub(r'[^\w\s]', '', user_text.lower()).strip()
-        if clean_cmd in ["bye", "goodbye", "good bye", "bye bye", "see you", "exit", "stop", "quit"]:
-            print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
-            try:
-                if kokoro_tts:
-                    samples, sample_rate = await asyncio.to_thread(
-                        kokoro_tts.create, ACTIVE_FAREWELL_TEXT, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
-                    )
-                    await asyncio.to_thread(play_audio_sync, samples, sample_rate)
-            except Exception as e:
-                print(f"Farewell playback error: {e}")
-            print("\n👋 Assistant shut down cleanly.")
-            os._exit(0)
+        if is_exit_command(user_text):
+            await say_farewell()
+            return
 
         can_listen_event.clear()
         reset_metrics()
@@ -513,34 +495,20 @@ async def stt_worker(stt_model):
         
         if text:
             user_has_spoken = True
-            clean_cmd = re.sub(r'[^\w\s]', '', text.lower()).strip()
-            if clean_cmd in ["bye", "goodbye", "good bye", "bye bye", "see you", "exit", "stop", "quit"]:
-                print(f"🗣️ You: {text}")
-                print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
-                try:
-                    if kokoro_tts:
-                        samples, sample_rate = await asyncio.to_thread(
-                            kokoro_tts.create, ACTIVE_FAREWELL_TEXT, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
-                        )
-                        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
-                except Exception as e:
-                    print(f"Farewell playback error: {e}")
-                print("\n👋 Assistant shut down cleanly.")
-                os._exit(0)
+            if is_exit_command(text):
+                await say_farewell(text)
+                stt_queue.task_done()
+                return
             await llm_queue.put(text)
         else:
             await tts_queue.put(None)
         stt_queue.task_done()
 
 async def llm_worker():
-    global conversation_history
-    system_prompt = ACTIVE_SYSTEM_PROMPT
-    
-    # Gemini 3 modeli için MINIMAL thinking (düşünme) yapılandırması
     generation_config = types.GenerateContentConfig(
         temperature=LLM_TEMPERATURE,
         max_output_tokens=LLM_MAX_TOKENS,
-        system_instruction=system_prompt,
+        system_instruction=ACTIVE_SYSTEM_PROMPT,
         thinking_config=types.ThinkingConfig(
             thinking_level="MINIMAL",
             include_thoughts=False
@@ -596,10 +564,11 @@ async def llm_worker():
         llm_queue.task_done()
 
 async def tts_chunk_worker():
-    global playback_sequence, playback_turn_id
     sentence_buffer = ""
-    delimiters = re.compile(r'([.?!:,;\n]+)')
+    delimiters = re.compile(r'([.?!\n]+)')
     is_first_chunk = True
+    playback_sequence = 0
+    playback_turn_id = 0
     
     while True:
         chunk = await tts_queue.get()
@@ -708,13 +677,28 @@ async def audio_player_worker():
         expected_sequences = turn_end_markers.get(current_turn_id)
         if expected_sequences is not None and next_sequence_id >= expected_sequences:
             rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
+            wait_time = (
+                perf_metrics["speech_start"] - perf_metrics["rec_start"]
+                if perf_metrics["speech_start"] > 0
+                else 0.0
+            )
+            capture_time = (
+                perf_metrics["rec_end"] - perf_metrics["speech_start"]
+                if perf_metrics["speech_start"] > 0
+                else rec_time
+            )
             stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
             llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
             reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
 
             if perf_metrics["llm_start"] > 0:
-                print(f"\n⏱️ Timing -> Rec: {rec_time:.2f}s | Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s (Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s")
+                print(
+                    f"\n⏱️ Timing -> Rec: {rec_time:.2f}s "
+                    f"(Wait: {wait_time:.2f}s, Speech/end: {capture_time:.2f}s) | "
+                    f"Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
+                    f"(Total: {llm_total:.2f}s) | 🔥 Reaction: {reaction_time:.2f}s"
+                )
                 print("-" * 50)
 
             turn_end_markers.pop(current_turn_id, None)
@@ -725,24 +709,26 @@ async def audio_player_worker():
         audio_queue.task_done()
 
 async def main():
-    setup_directories()
-    if LIST_AUDIO_DEVICES_ONLY:
-        print_audio_devices()
-        return
-
-    global SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
+    global kokoro_tts, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
+
     print("\n🚀 Perfect English Chatbot Started (Kokoro TTS & Google Gemini API & Aplay).")
+    kokoro_tts = await asyncio.to_thread(load_tts_model)
     await warmup_llm()
-    
-    stt_model = WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8", cpu_threads=WHISPER_THREADS)
-    
+
     if TEXT_MODE_ONLY:
         print("⌨️ Text mode enabled. Type your message and press Enter.")
         asyncio.create_task(text_input_worker())
     else:
+        stt_model = WhisperModel(
+            WHISPER_MODEL_SIZE,
+            device="cpu",
+            compute_type="int8",
+            cpu_threads=WHISPER_THREADS,
+        )
+        await asyncio.to_thread(warmup_stt_model, stt_model)
         asyncio.create_task(vad_worker())
-    asyncio.create_task(stt_worker(stt_model))
+        asyncio.create_task(stt_worker(stt_model))
     asyncio.create_task(llm_worker())
     asyncio.create_task(tts_chunk_worker())
     for _ in range(TTS_WORKER_COUNT):
@@ -754,11 +740,14 @@ async def main():
         intro_text = ACTIVE_INTRO_TEXT
         print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
         
-        if kokoro_tts:
-            samples, sample_rate = await asyncio.to_thread(
-                kokoro_tts.create, intro_text, voice=ACTIVE_VOICE_ID, speed=1.15, lang="en-us"
-            )
-            await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+        samples, sample_rate = await asyncio.to_thread(
+            kokoro_tts.create,
+            intro_text,
+            voice=ACTIVE_VOICE_ID,
+            speed=1.15,
+            lang="en-us",
+        )
+        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         
         conversation_history.append({"role": "user", "parts": [{"text": "Hello! Are you ready?"}]})
         conversation_history.append({"role": "model", "parts": [{"text": intro_text}]})
@@ -766,8 +755,12 @@ async def main():
         print(f"Intro playback error: {e}")
         
     can_listen_event.set()
-    while True: await asyncio.sleep(1)
+    await shutdown_event.wait()
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("\n👋 Exited.")
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\n👋 Exited.")
+    except Exception as error:
+        print(f"\n❌ Startup error: {error}")
