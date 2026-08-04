@@ -52,6 +52,7 @@ SELECTED_OUTPUT_DEVICE = OUTPUT_DEVICE
 KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
 KOKORO_VOICES = "voices/voices-v1.0.bin"
 kokoro_tts = None
+kokoro_lock = None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
@@ -486,6 +487,9 @@ async def text_input_worker():
 
         can_listen_event.clear()
         reset_metrics()
+        now = time.perf_counter()
+        perf_metrics["rec_start"] = now
+        perf_metrics["rec_end"] = now
         await llm_queue.put(user_text)
 
 async def stt_worker(stt_model):
@@ -642,9 +646,10 @@ async def tts_generator_worker():
                 if kokoro_tts:
                     if perf_metrics["tts_first_start"] == 0.0:
                         perf_metrics["tts_first_start"] = time.perf_counter()
-                    samples, sample_rate = await asyncio.to_thread(
-                        kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
-                    )
+                    async with kokoro_lock:
+                        samples, sample_rate = await asyncio.to_thread(
+                            kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
+                        )
                     if perf_metrics["tts_first_ready"] == 0.0:
                         perf_metrics["tts_first_ready"] = time.perf_counter()
                     await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
@@ -725,8 +730,9 @@ async def audio_player_worker():
         audio_queue.task_done()
 
 async def main():
-    global kokoro_tts, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
+    global kokoro_tts, kokoro_lock, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
+    kokoro_lock = asyncio.Lock()
 
     print("\n🚀 Perfect English Chatbot Started (Kokoro TTS & Google Gemini API & Aplay).")
     kokoro_tts = await asyncio.to_thread(load_tts_model)
