@@ -7,6 +7,7 @@ import re
 import sys
 import time
 import warnings
+import wave
 
 import numpy as np
 import sounddevice as sd
@@ -37,6 +38,7 @@ WHISPER_THREADS = TOTAL_LOGICAL_CORES
 INPUT_SAMPLE_RATE = 48000
 WHISPER_SAMPLE_RATE = 16000
 CHANNELS = 2
+LAST_CAPTURE_WAV = "last_user_audio_16k.wav"
 SPEECH_THRESHOLD = 400
 SPEECH_THRESHOLD_FACTOR = 1.55
 CALIBRATION_DURATION = 0.3
@@ -212,6 +214,20 @@ def downsample_audio(audio_data, source_rate, target_rate):
     source_positions = np.linspace(0, len(audio_data) - 1, num=len(audio_data), dtype=np.float32)
     target_positions = np.linspace(0, len(audio_data) - 1, num=target_length, dtype=np.float32)
     return np.interp(target_positions, source_positions, audio_data).astype(np.float32)
+
+
+def save_audio_debug_wav(audio_data, sample_rate, path=LAST_CAPTURE_WAV):
+    audio = np.asarray(audio_data, dtype=np.float32)
+    if audio.size == 0:
+        return
+
+    pcm16 = np.clip(audio, -1.0, 1.0)
+    pcm16 = (pcm16 * 32767.0).astype(np.int16)
+    with wave.open(path, "wb") as wav_file:
+        wav_file.setnchannels(1)
+        wav_file.setsampwidth(2)
+        wav_file.setframerate(sample_rate)
+        wav_file.writeframes(pcm16.tobytes())
 
 
 def calibrate_microphone_sync(fs, channels):
@@ -407,7 +423,9 @@ def record_audio_sync(fs, channels):
         if len(recorded_frames) > 0:
             recording = np.concatenate(recorded_frames, axis=0)
             recording = recording.flatten().astype(np.float32) / 32768.0
-            return downsample_audio(recording, fs, WHISPER_SAMPLE_RATE)
+            downsampled_recording = downsample_audio(recording, fs, WHISPER_SAMPLE_RATE)
+            save_audio_debug_wav(downsampled_recording, WHISPER_SAMPLE_RATE)
+            return downsampled_recording
         return None
     except Exception as e:
         print(f"⚠️ Microphone open/read error: {e}", flush=True)
