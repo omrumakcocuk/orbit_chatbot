@@ -1,7 +1,6 @@
 import asyncio
-import collections
+import json
 import os
-import queue
 import random
 import re
 import sys
@@ -12,17 +11,12 @@ import numpy as np
 import pyaudio
 import sounddevice as sd
 from dotenv import load_dotenv
-from faster_whisper import WhisperModel
 from google import genai
 from google.genai import types
 from kokoro_onnx import Kokoro
 from piper import PiperVoice
 from piper.config import SynthesisConfig
-
-try:
-    import sherpa_onnx
-except ModuleNotFoundError:
-    sherpa_onnx = None
+from vosk import KaldiRecognizer, Model, SetLogLevel
 
 load_dotenv()
 warnings.filterwarnings("ignore")
@@ -37,30 +31,20 @@ def _parse_device_index(value):
     except ValueError:
         return value
 
-TOTAL_LOGICAL_CORES = os.cpu_count() or 4
-WHISPER_THREADS = TOTAL_LOGICAL_CORES
-
-INPUT_SAMPLE_RATE = 16000
-WHISPER_SAMPLE_RATE = 16000
+_SPEECH_CFG = {}
+RATE = 16000
+CHUNK = 1024
 CHANNELS = 2
-MIC_GAIN = float(os.environ.get("MIC_GAIN", "15.0"))
-MIC_FORMAT = pyaudio.paInt16
-MIC_CHUNK = 1024
-SPEECH_THRESHOLD = 11000
-SPEECH_THRESHOLD_FACTOR = 1.55
-CALIBRATION_DURATION = 0.3
-SILENCE_DURATION = 0.6
-WAIT_FOR_SPEECH_TIMEOUT = 10.0  
-RECORDING_SAFETY_TIMEOUT = 60.0
-BLOCK_DURATION = MIC_CHUNK / float(INPUT_SAMPLE_RATE)
-MIN_SPEECH_DURATION = 0.15
-MIN_RECORDING_AFTER_SPEECH_START = 0.20
+FORMAT = pyaudio.paInt16
+OUTPUT_RATE = 24000
+LANGUAGE = _SPEECH_CFG.get("languageCode", "en-US")
+GAIN = 20.0
+SPEAKING_RATE = _SPEECH_CFG.get("speakingRate", 1.05)
+SENTENCE_PAUSE = 0.15
 INPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
 OUTPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_OUTPUT_DEVICE"))
 SELECTED_INPUT_DEVICE = INPUT_DEVICE
 SELECTED_OUTPUT_DEVICE = OUTPUT_DEVICE
-MIC_START_THRESHOLD = float(SPEECH_THRESHOLD)
-MIC_STOP_THRESHOLD = float(SPEECH_THRESHOLD) * 0.8
 
 KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
 KOKORO_VOICES = "voices/voices-v1.0.bin"
@@ -71,27 +55,12 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-STT_ENGINE = os.environ.get("STT_ENGINE", "sherpa").strip().lower()
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
-WHISPER_TRANSCRIBE_OPTIONS = {
-    "beam_size": 1,
-    "best_of": 1,
-    "language": "en",
-    "vad_filter": False,
-    "without_timestamps": True,
-    "condition_on_previous_text": False,
-    "temperature": 0.0,
-}
-SHERPA_SAMPLE_RATE = WHISPER_SAMPLE_RATE
-SHERPA_TOKENS = os.environ.get("SHERPA_TOKENS", "").strip()
-SHERPA_PARAFORMER = os.environ.get("SHERPA_PARAFORMER", "").strip()
 
 LLM_MAX_TOKENS = 96
 LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
 FIRST_TTS_WORDS = 5
 NEXT_TTS_WORDS = 10
-TTS_SPEECH_SPEED = 1.3
 
 perf_metrics = {}
 conversation_history = []
@@ -241,49 +210,6 @@ def downsample_audio(audio_data, source_rate, target_rate):
     return np.interp(target_positions, source_positions, audio_data).astype(np.float32)
 
 
-def calibrate_microphone_sync(fs, channels):
-    print("🎚️ Calibrating microphone; please stay quiet...", flush=True)
-    pya = pyaudio.PyAudio()
-    calibration_levels = []
-    stream = pya.open(
-        format=MIC_FORMAT,
-        channels=channels,
-        rate=fs,
-        input=True,
-        input_device_index=SELECTED_INPUT_DEVICE,
-        frames_per_buffer=MIC_CHUNK,
-    )
-    calibration_chunks = max(1, int(CALIBRATION_DURATION / BLOCK_DURATION))
-
-    try:
-        for _ in range(calibration_chunks):
-            data = stream.read(MIC_CHUNK, exception_on_overflow=False)
-            block = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
-            block = np.clip(block * MIC_GAIN, -32768.0, 32767.0)
-            calibration_levels.append(float(np.sqrt(np.mean(np.square(block)))))
-    finally:
-        stream.stop_stream()
-        stream.close()
-        pya.terminate()
-
-    noise_floor = float(np.median(calibration_levels)) if calibration_levels else 0.0
-    start_threshold = max(
-        float(SPEECH_THRESHOLD),
-        noise_floor * SPEECH_THRESHOLD_FACTOR,
-        noise_floor + 35.0,
-    )
-    stop_threshold = max(
-        float(SPEECH_THRESHOLD) * 0.8,
-        noise_floor * 1.35,
-        start_threshold * 0.72,
-    )
-    print(
-        f"🎚️ Mic ready -> noise={noise_floor:.1f}, "
-        f"start={start_threshold:.1f}, stop={stop_threshold:.1f}.",
-        flush=True,
-    )
-    return start_threshold, stop_threshold
-
 async def warmup_llm():
     global gemini_client
     print("Checking Gemini API configuration...")
@@ -322,7 +248,13 @@ def load_tts_model():
     raise RuntimeError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}. Use 'piper' or 'kokoro'.")
 
 
-def create_tts_audio(text, speed=TTS_SPEECH_SPEED):
+def _prepare_tts_output(samples, sample_rate):
+    output = downsample_audio(np.asarray(samples), sample_rate, OUTPUT_RATE)
+    pause = np.zeros(int(OUTPUT_RATE * SENTENCE_PAUSE), dtype=output.dtype)
+    return np.concatenate((output, pause)), OUTPUT_RATE
+
+
+def create_tts_audio(text, speed=SPEAKING_RATE):
     if TTS_ENGINE == "piper":
         if piper_tts is None:
             raise RuntimeError("Piper TTS is not loaded")
@@ -333,216 +265,92 @@ def create_tts_audio(text, speed=TTS_SPEECH_SPEED):
             raise RuntimeError("Piper generated no audio")
 
         samples = np.concatenate([chunk.audio_float_array for chunk in chunks])
-        return samples, chunks[0].sample_rate
+        return _prepare_tts_output(samples, chunks[0].sample_rate)
 
     if kokoro_tts is None:
         raise RuntimeError("Kokoro TTS is not loaded")
-    return kokoro_tts.create(
+    samples, sample_rate = kokoro_tts.create(
         text,
         voice=ACTIVE_VOICE_ID,
         speed=speed,
         lang="en-us",
     )
+    return _prepare_tts_output(samples, sample_rate)
 
-def record_audio_sync(fs, channels):
+
+def load_vosk_model():
+    SetLogLevel(-1)
+    model_path = os.environ.get("VOSK_MODEL_PATH", "").strip()
+    if model_path:
+        print(f"Loading Vosk model from {model_path}...")
+        model = Model(model_path)
+    else:
+        model_language = LANGUAGE.lower()
+        if not model_language.startswith("en-"):
+            model_language = model_language.split("-", 1)[0]
+        print(f"Loading Vosk model for {model_language}...")
+        model = Model(lang=model_language)
+    print("✅ Vosk model ready.")
+    return model
+
+
+def record_audio_sync(vosk_model):
     pya = pyaudio.PyAudio()
-    recorded_frames = []
-    start_time = time.perf_counter()
+    recognizer = KaldiRecognizer(vosk_model, RATE)
     speech_started = False
-    first_speech_block_time = 0.0
-    silence_time = 0.0
-
-    pre_speech_buffer_size = int(0.35 / BLOCK_DURATION)
-    pre_speech_blocks = collections.deque(maxlen=pre_speech_buffer_size)
-    start_threshold = MIC_START_THRESHOLD
-    stop_threshold = MIC_STOP_THRESHOLD
-    input_device = SELECTED_INPUT_DEVICE
 
     try:
-        print(f"🎚️ Record config -> fs={fs}, channels={channels}", flush=True)
+        print(
+            f"🎚️ Record config -> rate={RATE}, channels={CHANNELS}, gain={GAIN}",
+            flush=True,
+        )
         stream = pya.open(
-            format=MIC_FORMAT,
-            channels=channels,
-            rate=fs,
+            format=FORMAT,
+            channels=CHANNELS,
+            rate=RATE,
             input=True,
-            input_device_index=input_device,
-            frames_per_buffer=MIC_CHUNK,
+            input_device_index=SELECTED_INPUT_DEVICE,
+            frames_per_buffer=CHUNK,
         )
         try:
             while True:
-                current_time = time.perf_counter()
-                elapsed_total = current_time - start_time
-                
-                if not speech_started and elapsed_total > WAIT_FOR_SPEECH_TIMEOUT:
-                    break
-
                 try:
-                    data = stream.read(MIC_CHUNK, exception_on_overflow=False)
+                    data = stream.read(CHUNK, exception_on_overflow=False)
                 except Exception as e:
                     print(f"⚠️ Audio read error: {e}", flush=True)
                     continue
 
-                mono_block = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
-                mono_block = np.clip(mono_block * MIC_GAIN, -32768.0, 32767.0)
-                rms = float(np.sqrt(np.mean(np.square(mono_block))))
+                stereo_samples = np.frombuffer(data, dtype=np.int16)
+                mono_samples = stereo_samples[0::2].astype(np.float32)
+                mono_samples = np.clip(
+                    mono_samples * GAIN,
+                    -32768.0,
+                    32767.0,
+                ).astype(np.int16)
+                mono_data = mono_samples.tobytes()
 
-                if not speech_started:
-                    if rms > start_threshold:
-                        pre_speech_blocks.append(mono_block)
-                        speech_started = True
-                        print(f"✅ Speech detected (RMS={rms:.1f}).", flush=True)
-                        first_speech_block_time = current_time
-                        perf_metrics["speech_start"] = current_time
-                        recorded_frames.extend(pre_speech_blocks)
-                        pre_speech_blocks.clear()
-                    else:
-                        pre_speech_blocks.append(mono_block)
-                else:
-                    recorded_frames.append(mono_block)
-                    if rms > stop_threshold:
-                        silence_time = 0.0
-                    else:
-                        silence_time += BLOCK_DURATION
+                if recognizer.AcceptWaveform(mono_data):
+                    text = json.loads(recognizer.Result()).get("text", "").strip()
+                    if text:
+                        if not speech_started:
+                            perf_metrics["speech_start"] = time.perf_counter()
+                        print(f"🔎 Vosk raw: {text}", flush=True)
+                        return text
+                    continue
 
-                    speech_duration = current_time - first_speech_block_time
-                    if speech_duration >= RECORDING_SAFETY_TIMEOUT:
-                        print("⚠️ Recording safety timeout reached; transcribing.", flush=True)
-                        break
-                    if (
-                        speech_duration > MIN_RECORDING_AFTER_SPEECH_START
-                        and silence_time >= SILENCE_DURATION
-                    ):
-                        break
+                partial = json.loads(recognizer.PartialResult()).get("partial", "").strip()
+                if partial and not speech_started:
+                    speech_started = True
+                    perf_metrics["speech_start"] = time.perf_counter()
+                    print("✅ Speech detected by Vosk.", flush=True)
         finally:
             stream.stop_stream()
             stream.close()
-                            
-        if not speech_started:
-            if (time.perf_counter() - start_time) > WAIT_FOR_SPEECH_TIMEOUT:
-                print("⌛ Listening timeout reached without speech.", flush=True)
-                return "TIMEOUT"
-            return None
-            
-        if (time.perf_counter() - first_speech_block_time) < MIN_SPEECH_DURATION:
-            return None
-        
-        if len(recorded_frames) > 0:
-            recording = np.concatenate(recorded_frames, axis=0)
-            recording = recording.flatten().astype(np.float32) / 32768.0
-            return downsample_audio(recording, fs, WHISPER_SAMPLE_RATE)
-        return None
     except Exception as e:
-        print(f"⚠️ Microphone open/read error: {e}", flush=True)
+        print(f"⚠️ Vosk microphone error: {e}", flush=True)
         return None
     finally:
         pya.terminate()
-
-def transcribe_audio_sync(stt_model, audio_data):
-    if STT_ENGINE == "sherpa":
-        try:
-            stream = stt_model.create_stream()
-            stream.accept_waveform(SHERPA_SAMPLE_RATE, audio_data)
-            stt_model.decode_stream(stream)
-            result = getattr(stream, "result", "")
-            if hasattr(result, "text"):
-                result = result.text
-            text = str(result).strip()
-            print(f"🔎 STT raw: {text or '[empty]'}")
-            return text
-        except Exception as e:
-            print(f"❌ sherpa-onnx transcription error: {e}", flush=True)
-            return ""
-
-    try:
-        segments, _ = stt_model.transcribe(
-            audio_data,
-            **WHISPER_TRANSCRIBE_OPTIONS,
-        )
-        segments = list(segments)
-        raw_segments = []
-        valid_texts = []
-
-        for segment in segments:
-            seg_text = segment.text.strip()
-            if seg_text:
-                raw_segments.append(seg_text)
-            if segment.no_speech_prob <= 0.85 and segment.avg_logprob >= -1.5 and seg_text:
-                valid_texts.append(seg_text)
-
-        raw_text = " ".join(raw_segments).strip()
-        text = " ".join(valid_texts).strip() if valid_texts else raw_text
-        if raw_text:
-            debug_segments = " | ".join(
-                f"{segment.text.strip()} (ns={segment.no_speech_prob:.2f}, lp={segment.avg_logprob:.2f})"
-                for segment in segments
-                if segment.text.strip()
-            )
-            print(f"🔎 STT raw: {debug_segments}")
-        if not text:
-            return ""
-        
-        lower_text = text.lower()
-        # İNGİLİZCE HALÜSİNASYONLAR
-        hallucinations = ["thank you for watching", "thanks for watching", "please subscribe", "subscribe to my channel", "amara.org"]
-        for h in hallucinations: lower_text = lower_text.replace(h, "")
-        cleaned_text = re.sub(r'[^\w\s]', '', lower_text).strip()
-        if len(cleaned_text) <= 1:
-            print("⚠️ STT result discarded after cleanup.")
-            return ""
-        return text
-    except Exception as e:
-        print(f"❌ Whisper transcription error: {e}", flush=True)
-        return ""
-
-
-def warmup_stt_model(stt_model):
-    if STT_ENGINE == "sherpa":
-        print("Warming up sherpa-onnx model...")
-        silence = np.zeros(SHERPA_SAMPLE_RATE, dtype=np.float32)
-        stream = stt_model.create_stream()
-        stream.accept_waveform(SHERPA_SAMPLE_RATE, silence)
-        stt_model.decode_stream(stream)
-        print("✅ sherpa-onnx model ready.")
-        return
-
-    print("Warming up Whisper model...")
-    silence = np.zeros(WHISPER_SAMPLE_RATE, dtype=np.float32)
-    segments, _ = stt_model.transcribe(
-        silence,
-        **WHISPER_TRANSCRIBE_OPTIONS,
-    )
-    list(segments)
-    print("✅ Whisper model ready.")
-
-
-def load_stt_model():
-    if STT_ENGINE == "whisper":
-        return WhisperModel(
-            WHISPER_MODEL_SIZE,
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=WHISPER_THREADS,
-        )
-
-    if STT_ENGINE == "sherpa":
-        if sherpa_onnx is None:
-            raise RuntimeError("sherpa_onnx is not installed")
-        if not SHERPA_PARAFORMER or not SHERPA_TOKENS:
-            raise RuntimeError(
-                "Set SHERPA_PARAFORMER and SHERPA_TOKENS to use STT_ENGINE=sherpa"
-            )
-        return sherpa_onnx.OfflineRecognizer.from_paraformer(
-            paraformer=SHERPA_PARAFORMER,
-            tokens=SHERPA_TOKENS,
-            num_threads=TOTAL_LOGICAL_CORES,
-            sample_rate=SHERPA_SAMPLE_RATE,
-            feature_dim=80,
-            decoding_method="greedy_search",
-            debug=False,
-            provider="cpu",
-        )
-
-    raise RuntimeError(f"Unsupported STT_ENGINE: {STT_ENGINE}. Use 'whisper' or 'sherpa'.")
 
 def remove_emojis(text):
     emoji_pattern = re.compile(r'[\U00010000-\U0010ffff]|[\u2600-\u27BF]|[\u2300-\u23FF]|[\u2B50-\u2B55]', flags=re.UNICODE)
@@ -557,7 +365,6 @@ def clean_text_for_tts(text):
 
 # --- ASYNC QUEUE PIPELINE WORKERS ---
 
-stt_queue = asyncio.Queue()
 llm_queue = asyncio.Queue()
 tts_queue = asyncio.Queue()
 playback_queue = asyncio.Queue()
@@ -630,7 +437,7 @@ async def say_farewell(user_text=None):
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             ACTIVE_FAREWELL_TEXT,
-            TTS_SPEECH_SPEED,
+            SPEAKING_RATE,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
     except Exception as e:
@@ -640,7 +447,7 @@ async def say_farewell(user_text=None):
     shutdown_event.set()
 
 
-async def vad_worker():
+async def vad_worker(vosk_model):
     global user_has_spoken
     while True:
         await can_listen_event.wait()
@@ -652,14 +459,18 @@ async def vad_worker():
         reset_metrics()
         perf_metrics["rec_start"] = time.perf_counter()
         
-        audio_data = await asyncio.to_thread(record_audio_sync, INPUT_SAMPLE_RATE, CHANNELS)
+        perf_metrics["stt_start"] = time.perf_counter()
+        text = await asyncio.to_thread(record_audio_sync, vosk_model)
         perf_metrics["rec_end"] = time.perf_counter()
-        
-        if isinstance(audio_data, np.ndarray):
+        perf_metrics["stt_end"] = perf_metrics["rec_end"]
+
+        if text:
             can_listen_event.clear()
-            await stt_queue.put(audio_data)
-        elif audio_data == "TIMEOUT":
-            await asyncio.sleep(0.1)
+            user_has_spoken = True
+            if is_exit_command(text):
+                await say_farewell(text)
+                return
+            await llm_queue.put(text)
         else:
             await asyncio.sleep(0.1)
 
@@ -682,23 +493,6 @@ async def text_input_worker():
         perf_metrics["rec_start"] = now
         perf_metrics["rec_end"] = now
         await llm_queue.put(user_text)
-
-async def stt_worker(stt_model):
-    global user_has_spoken
-    while True:
-        audio_data = await stt_queue.get()
-        perf_metrics["stt_start"] = time.perf_counter()
-        text = await asyncio.to_thread(transcribe_audio_sync, stt_model, audio_data)
-        perf_metrics["stt_end"] = time.perf_counter()
-        
-        if text:
-            user_has_spoken = True
-            if is_exit_command(text):
-                await say_farewell(text)
-                return
-            await llm_queue.put(text)
-        else:
-            await tts_queue.put(None)
 
 async def llm_worker():
     generation_config = types.GenerateContentConfig(
@@ -848,7 +642,7 @@ async def tts_generator_worker():
                 if perf_metrics["tts_first_start"] == 0.0:
                     perf_metrics["tts_first_start"] = time.perf_counter()
                 samples, sample_rate = await asyncio.to_thread(
-                    create_tts_audio, sentence, TTS_SPEECH_SPEED
+                    create_tts_audio, sentence, SPEAKING_RATE
                 )
                 if perf_metrics["tts_first_ready"] == 0.0:
                     perf_metrics["tts_first_ready"] = time.perf_counter()
@@ -931,7 +725,7 @@ async def audio_player_worker():
                     print(
                         f"\n⏱️ Timing -> Rec: {rec_time:.2f}s "
                         f"(Wait: {wait_time:.2f}s, Speech/end: {capture_time:.2f}s) | "
-                        f"Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
+                        f"Vosk: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
                         f"(Total: {llm_total:.2f}s) | TTS Queue: {chunk_wait:.2f}s "
                         f"| TTS Gen: {tts_gen:.2f}s | Play Wait: {playback_wait:.2f}s "
                         f"| 🔥 Reaction: {reaction_time:.2f}s"
@@ -950,12 +744,11 @@ async def audio_player_worker():
 
 async def main():
     global SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
-    global MIC_START_THRESHOLD, MIC_STOP_THRESHOLD
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
 
     print(
         f"\n🚀 Perfect English Chatbot Started "
-        f"({TTS_ENGINE.title()} TTS, {STT_ENGINE.title()} STT & Google Gemini API)."
+        f"({TTS_ENGINE.title()} TTS, Vosk STT & Google Gemini API)."
     )
     await asyncio.to_thread(load_tts_model)
     await warmup_llm()
@@ -964,18 +757,8 @@ async def main():
         print("⌨️ Text mode enabled. Type your message and press Enter.")
         asyncio.create_task(text_input_worker())
     else:
-        stt_model = await asyncio.to_thread(load_stt_model)
-        await asyncio.to_thread(warmup_stt_model, stt_model)
-        try:
-            MIC_START_THRESHOLD, MIC_STOP_THRESHOLD = await asyncio.to_thread(
-                calibrate_microphone_sync,
-                INPUT_SAMPLE_RATE,
-                CHANNELS,
-            )
-        except Exception as e:
-            print(f"⚠️ Microphone calibration failed; using default thresholds: {e}")
-        asyncio.create_task(vad_worker())
-        asyncio.create_task(stt_worker(stt_model))
+        vosk_model = await asyncio.to_thread(load_vosk_model)
+        asyncio.create_task(vad_worker(vosk_model))
     asyncio.create_task(llm_worker())
     asyncio.create_task(tts_chunk_worker())
     asyncio.create_task(tts_generator_worker())
@@ -989,7 +772,7 @@ async def main():
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             intro_text,
-            TTS_SPEECH_SPEED,
+            SPEAKING_RATE,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         

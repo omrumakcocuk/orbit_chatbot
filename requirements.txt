@@ -1,8 +1,7 @@
 numpy
 pyaudio
 sounddevice
-faster-whisper
-sherpa-onnx
+vosk
 google-genai
 kokoro-onnx
 piper-tts
