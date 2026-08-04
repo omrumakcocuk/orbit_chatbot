@@ -42,6 +42,7 @@ SPEECH_THRESHOLD_FACTOR = 1.55
 CALIBRATION_DURATION = 0.3
 SILENCE_DURATION = 0.6
 WAIT_FOR_SPEECH_TIMEOUT = 10.0  
+RECORDING_SAFETY_TIMEOUT = 60.0
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.15
 MIN_RECORDING_AFTER_SPEECH_START = 0.15
@@ -49,13 +50,14 @@ INPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
 OUTPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_OUTPUT_DEVICE"))
 SELECTED_INPUT_DEVICE = INPUT_DEVICE
 SELECTED_OUTPUT_DEVICE = OUTPUT_DEVICE
+MIC_START_THRESHOLD = float(SPEECH_THRESHOLD)
+MIC_STOP_THRESHOLD = float(SPEECH_THRESHOLD) * 0.8
 
 KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
 KOKORO_VOICES = "voices/voices-v1.0.bin"
 TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper").strip().lower()
 kokoro_tts = None
 piper_tts = None
-tts_lock = None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
@@ -76,7 +78,7 @@ LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
 FIRST_TTS_WORDS = 5
 NEXT_TTS_WORDS = 10
-TTS_WORKER_COUNT = 2
+TTS_SPEECH_SPEED = 1.45
 
 perf_metrics = {}
 conversation_history = []
@@ -211,6 +213,50 @@ def downsample_audio(audio_data, source_rate, target_rate):
     target_positions = np.linspace(0, len(audio_data) - 1, num=target_length, dtype=np.float32)
     return np.interp(target_positions, source_positions, audio_data).astype(np.float32)
 
+
+def calibrate_microphone_sync(fs, channels):
+    print("🎚️ Calibrating microphone; please stay quiet...", flush=True)
+    frame_count = max(1, int(fs * CALIBRATION_DURATION))
+    recording = sd.rec(
+        frame_count,
+        samplerate=fs,
+        channels=channels,
+        dtype="int16",
+        device=SELECTED_INPUT_DEVICE,
+    )
+    sd.wait()
+
+    audio = np.asarray(recording, dtype=np.float32)
+    if audio.ndim == 1:
+        audio = audio[:, None]
+
+    block_size = max(1, int(fs * BLOCK_DURATION))
+    calibration_levels = []
+    for offset in range(0, len(audio), block_size):
+        block = audio[offset:offset + block_size]
+        if len(block) == 0:
+            continue
+        channel_rms = np.sqrt(np.mean(np.square(block), axis=0))
+        calibration_levels.append(float(np.max(channel_rms)))
+
+    noise_floor = float(np.median(calibration_levels)) if calibration_levels else 0.0
+    start_threshold = max(
+        float(SPEECH_THRESHOLD),
+        noise_floor * SPEECH_THRESHOLD_FACTOR,
+        noise_floor + 35.0,
+    )
+    stop_threshold = max(
+        float(SPEECH_THRESHOLD) * 0.8,
+        noise_floor * 1.35,
+        start_threshold * 0.72,
+    )
+    print(
+        f"🎚️ Mic ready -> noise={noise_floor:.1f}, "
+        f"start={start_threshold:.1f}, stop={stop_threshold:.1f}.",
+        flush=True,
+    )
+    return start_threshold, stop_threshold
+
 async def warmup_llm():
     global gemini_client
     print("Checking Gemini API configuration...")
@@ -249,7 +295,7 @@ def load_tts_model():
     raise RuntimeError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}. Use 'piper' or 'kokoro'.")
 
 
-def create_tts_audio(text, speed=1.45):
+def create_tts_audio(text, speed=TTS_SPEECH_SPEED):
     if TTS_ENGINE == "piper":
         if piper_tts is None:
             raise RuntimeError("Piper TTS is not loaded")
@@ -282,10 +328,8 @@ def record_audio_sync(fs, channels):
     pre_speech_buffer_size = int(0.35 / BLOCK_DURATION)
     pre_speech_blocks = collections.deque(maxlen=pre_speech_buffer_size)
     audio_blocks = queue.Queue()
-    calibration_blocks = max(1, int(CALIBRATION_DURATION / BLOCK_DURATION))
-    calibration_levels = []
-    start_threshold = float(SPEECH_THRESHOLD)
-    stop_threshold = float(SPEECH_THRESHOLD)
+    start_threshold = MIC_START_THRESHOLD
+    stop_threshold = MIC_STOP_THRESHOLD
 
     def audio_callback(indata, _frames, _callback_time, status):
         if status:
@@ -323,28 +367,6 @@ def record_audio_sync(fs, channels):
                 rms = float(channel_rms[active_channel])
                 mono_block = audio_block[:, active_channel]
 
-                if len(calibration_levels) < calibration_blocks:
-                    calibration_levels.append(rms)
-                    pre_speech_blocks.append(mono_block)
-                    if len(calibration_levels) == calibration_blocks:
-                        noise_floor = float(np.median(calibration_levels))
-                        start_threshold = max(
-                            float(SPEECH_THRESHOLD),
-                            noise_floor * SPEECH_THRESHOLD_FACTOR,
-                            noise_floor + 35.0,
-                        )
-                        stop_threshold = max(
-                            float(SPEECH_THRESHOLD) * 0.8,
-                            noise_floor * 1.35,
-                            start_threshold * 0.72,
-                        )
-                        print(
-                            f"🎚️ Mic ready -> noise={noise_floor:.1f}, "
-                            f"start={start_threshold:.1f}, stop={stop_threshold:.1f}. Talk now.",
-                            flush=True,
-                        )
-                    continue
-
                 if not speech_started:
                     if rms > start_threshold:
                         pre_speech_blocks.append(mono_block)
@@ -364,6 +386,9 @@ def record_audio_sync(fs, channels):
                         silence_time += BLOCK_DURATION
 
                     speech_duration = current_time - first_speech_block_time
+                    if speech_duration >= RECORDING_SAFETY_TIMEOUT:
+                        print("⚠️ Recording safety timeout reached; transcribing.", flush=True)
+                        break
                     if (
                         speech_duration > MIN_RECORDING_AFTER_SPEECH_START
                         and silence_time >= SILENCE_DURATION
@@ -527,7 +552,7 @@ async def say_farewell(user_text=None):
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             ACTIVE_FAREWELL_TEXT,
-            1.45,
+            TTS_SPEECH_SPEED,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
     except Exception as e:
@@ -592,12 +617,10 @@ async def stt_worker(stt_model):
             user_has_spoken = True
             if is_exit_command(text):
                 await say_farewell(text)
-                stt_queue.task_done()
                 return
             await llm_queue.put(text)
         else:
             await tts_queue.put(None)
-        stt_queue.task_done()
 
 async def llm_worker():
     generation_config = types.GenerateContentConfig(
@@ -656,7 +679,6 @@ async def llm_worker():
         perf_metrics["llm_end"] = time.perf_counter()
         print() 
         await tts_queue.put(None)
-        llm_queue.task_done()
 
 async def tts_chunk_worker():
     sentence_buffer = ""
@@ -678,8 +700,7 @@ async def tts_chunk_worker():
                     playback_sequence += 1
             sentence_buffer = ""
             is_first_chunk = True
-            for _ in range(TTS_WORKER_COUNT):
-                await playback_queue.put(("END", current_turn_id, playback_sequence))
+            await playback_queue.put(("END", current_turn_id, playback_sequence))
             playback_turn_id += 1
             playback_sequence = 0
         else:
@@ -734,8 +755,6 @@ async def tts_chunk_worker():
                     playback_sequence += 1
                     is_first_chunk = False
                 
-        tts_queue.task_done()
-
 # YENİ: Metni sese çevirir ve bellekteki audio parçalarını kuyruğa yollar
 async def tts_generator_worker():
     while True:
@@ -750,97 +769,111 @@ async def tts_generator_worker():
             try:
                 if perf_metrics["tts_first_start"] == 0.0:
                     perf_metrics["tts_first_start"] = time.perf_counter()
-                async with tts_lock:
-                    samples, sample_rate = await asyncio.to_thread(
-                        create_tts_audio, sentence, 1.45
-                    )
+                samples, sample_rate = await asyncio.to_thread(
+                    create_tts_audio, sentence, TTS_SPEECH_SPEED
+                )
                 if perf_metrics["tts_first_ready"] == 0.0:
                     perf_metrics["tts_first_ready"] = time.perf_counter()
                 await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
                 
             except Exception as e:
                 print(f"❌ {TTS_ENGINE.title()} generation error: {e}")
-                
-        playback_queue.task_done()
+                await audio_queue.put(("SKIP", turn_id, sequence_id))
 
 # YENİ: Hazır ses parçalarını sırası korunarak çalar
 async def audio_player_worker():
     current_turn_id = 0
     next_sequence_id = 0
     pending_audio = {}
+    skipped_audio = set()
     turn_end_markers = {}
     audio_player = ContinuousAudioPlayer()
 
-    while True:
-        item = await audio_queue.get()
-        
-        if isinstance(item, tuple) and item and item[0] == "END":
-            _, turn_id, total_sequences = item
-            turn_end_markers[turn_id] = total_sequences
-        else:
-            turn_id, sequence_id, samples, sample_rate = item
-            pending_audio[(turn_id, sequence_id)] = (samples, sample_rate)
+    try:
+        while True:
+            item = await audio_queue.get()
 
-        while (current_turn_id, next_sequence_id) in pending_audio:
-            samples, sample_rate = pending_audio.pop((current_turn_id, next_sequence_id))
-            if perf_metrics["first_audio_played"] == 0.0:
-                perf_metrics["first_audio_played"] = time.perf_counter()
+            if isinstance(item, tuple) and item and item[0] == "END":
+                _, turn_id, total_sequences = item
+                turn_end_markers[turn_id] = total_sequences
+            elif isinstance(item, tuple) and item and item[0] == "SKIP":
+                _, turn_id, sequence_id = item
+                skipped_audio.add((turn_id, sequence_id))
+            else:
+                turn_id, sequence_id, samples, sample_rate = item
+                pending_audio[(turn_id, sequence_id)] = (samples, sample_rate)
 
-            try:
-                await asyncio.to_thread(audio_player.play, samples, sample_rate)
-            except Exception as e:
-                print(f"❌ Audio play error: {e}")
+            while True:
+                sequence_key = (current_turn_id, next_sequence_id)
+                if sequence_key in skipped_audio:
+                    skipped_audio.remove(sequence_key)
+                    next_sequence_id += 1
+                    continue
+                if sequence_key not in pending_audio:
+                    break
 
-            next_sequence_id += 1
+                samples, sample_rate = pending_audio.pop(sequence_key)
+                if perf_metrics["first_audio_played"] == 0.0:
+                    perf_metrics["first_audio_played"] = time.perf_counter()
 
-        expected_sequences = turn_end_markers.get(current_turn_id)
-        if expected_sequences is not None and next_sequence_id >= expected_sequences:
-            try:
-                await asyncio.to_thread(audio_player.finish)
-            except Exception as e:
-                print(f"❌ Audio finish error: {e}")
+                try:
+                    await asyncio.to_thread(audio_player.play, samples, sample_rate)
+                except Exception as e:
+                    print(f"❌ Audio play error: {e}")
 
-            rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
-            wait_time = (
-                perf_metrics["speech_start"] - perf_metrics["rec_start"]
-                if perf_metrics["speech_start"] > 0
-                else 0.0
-            )
-            capture_time = (
-                perf_metrics["rec_end"] - perf_metrics["speech_start"]
-                if perf_metrics["speech_start"] > 0
-                else rec_time
-            )
-            stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
-            llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
-            llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
-            chunk_wait = perf_metrics["first_tts_chunk_queued"] - perf_metrics["llm_first_token"] if perf_metrics["first_tts_chunk_queued"] > 0 and perf_metrics["llm_first_token"] > 0 else 0
-            tts_gen = perf_metrics["tts_first_ready"] - perf_metrics["tts_first_start"] if perf_metrics["tts_first_ready"] > 0 and perf_metrics["tts_first_start"] > 0 else 0
-            playback_wait = perf_metrics["first_audio_played"] - perf_metrics["tts_first_ready"] if perf_metrics["first_audio_played"] > 0 and perf_metrics["tts_first_ready"] > 0 else 0
-            reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
+                next_sequence_id += 1
 
-            if perf_metrics["llm_start"] > 0:
-                print(
-                    f"\n⏱️ Timing -> Rec: {rec_time:.2f}s "
-                    f"(Wait: {wait_time:.2f}s, Speech/end: {capture_time:.2f}s) | "
-                    f"Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
-                    f"(Total: {llm_total:.2f}s) | TTS Queue: {chunk_wait:.2f}s "
-                    f"| TTS Gen: {tts_gen:.2f}s | Play Wait: {playback_wait:.2f}s "
-                    f"| 🔥 Reaction: {reaction_time:.2f}s"
+            expected_sequences = turn_end_markers.get(current_turn_id)
+            if expected_sequences is not None and next_sequence_id >= expected_sequences:
+                try:
+                    await asyncio.to_thread(audio_player.finish)
+                except Exception as e:
+                    print(f"❌ Audio finish error: {e}")
+
+                rec_time = perf_metrics["rec_end"] - perf_metrics["rec_start"]
+                wait_time = (
+                    perf_metrics["speech_start"] - perf_metrics["rec_start"]
+                    if perf_metrics["speech_start"] > 0
+                    else 0.0
                 )
-                print("-" * 50)
+                capture_time = (
+                    perf_metrics["rec_end"] - perf_metrics["speech_start"]
+                    if perf_metrics["speech_start"] > 0
+                    else rec_time
+                )
+                stt_time = perf_metrics["stt_end"] - perf_metrics["stt_start"]
+                llm_first = perf_metrics["llm_first_token"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
+                llm_total = perf_metrics["llm_end"] - perf_metrics["llm_start"] if perf_metrics["llm_start"] > 0 else 0
+                chunk_wait = perf_metrics["first_tts_chunk_queued"] - perf_metrics["llm_first_token"] if perf_metrics["first_tts_chunk_queued"] > 0 and perf_metrics["llm_first_token"] > 0 else 0
+                tts_gen = perf_metrics["tts_first_ready"] - perf_metrics["tts_first_start"] if perf_metrics["tts_first_ready"] > 0 and perf_metrics["tts_first_start"] > 0 else 0
+                playback_wait = perf_metrics["first_audio_played"] - perf_metrics["tts_first_ready"] if perf_metrics["first_audio_played"] > 0 and perf_metrics["tts_first_ready"] > 0 else 0
+                reaction_time = perf_metrics["first_audio_played"] - perf_metrics["rec_end"] if perf_metrics["first_audio_played"] > 0 else 0
 
-            turn_end_markers.pop(current_turn_id, None)
-            current_turn_id += 1
-            next_sequence_id = 0
-            can_listen_event.set()
-                
-        audio_queue.task_done()
+                if perf_metrics["llm_start"] > 0:
+                    print(
+                        f"\n⏱️ Timing -> Rec: {rec_time:.2f}s "
+                        f"(Wait: {wait_time:.2f}s, Speech/end: {capture_time:.2f}s) | "
+                        f"Whisper: {stt_time:.2f}s | Gemini First: {llm_first:.2f}s "
+                        f"(Total: {llm_total:.2f}s) | TTS Queue: {chunk_wait:.2f}s "
+                        f"| TTS Gen: {tts_gen:.2f}s | Play Wait: {playback_wait:.2f}s "
+                        f"| 🔥 Reaction: {reaction_time:.2f}s"
+                    )
+                    print("-" * 50)
+
+                turn_end_markers.pop(current_turn_id, None)
+                current_turn_id += 1
+                next_sequence_id = 0
+                can_listen_event.set()
+    finally:
+        try:
+            audio_player.close()
+        except Exception as e:
+            print(f"❌ Audio close error: {e}")
 
 async def main():
-    global tts_lock, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
+    global SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
+    global MIC_START_THRESHOLD, MIC_STOP_THRESHOLD
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
-    tts_lock = asyncio.Lock()
 
     print(f"\n🚀 Perfect English Chatbot Started ({TTS_ENGINE.title()} TTS & Google Gemini API).")
     await asyncio.to_thread(load_tts_model)
@@ -857,12 +890,19 @@ async def main():
             cpu_threads=WHISPER_THREADS,
         )
         await asyncio.to_thread(warmup_stt_model, stt_model)
+        try:
+            MIC_START_THRESHOLD, MIC_STOP_THRESHOLD = await asyncio.to_thread(
+                calibrate_microphone_sync,
+                INPUT_SAMPLE_RATE,
+                CHANNELS,
+            )
+        except Exception as e:
+            print(f"⚠️ Microphone calibration failed; using default thresholds: {e}")
         asyncio.create_task(vad_worker())
         asyncio.create_task(stt_worker(stt_model))
     asyncio.create_task(llm_worker())
     asyncio.create_task(tts_chunk_worker())
-    for _ in range(TTS_WORKER_COUNT):
-        asyncio.create_task(tts_generator_worker())
+    asyncio.create_task(tts_generator_worker())
     asyncio.create_task(audio_player_worker())
     
     # Giriş cümlesini de yeni sisteme uygun güvenli şekilde hazırlıyoruz
@@ -873,7 +913,7 @@ async def main():
         samples, sample_rate = await asyncio.to_thread(
             create_tts_audio,
             intro_text,
-            1.45,
+            TTS_SPEECH_SPEED,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         
