@@ -9,6 +9,7 @@ import time
 import warnings
 
 import numpy as np
+import sounddevice as sd
 from dotenv import load_dotenv
 from faster_whisper import WhisperModel
 from google import genai
@@ -21,11 +22,6 @@ load_dotenv()
 warnings.filterwarnings("ignore")
 
 TEXT_MODE_ONLY = "--text-mode" in sys.argv
-
-try:
-    import sounddevice as sd
-except ModuleNotFoundError:
-    sd = None
 
 def _parse_device_index(value):
     if value is None or value == "":
@@ -162,9 +158,6 @@ def reset_metrics():
     }
 
 def print_audio_devices():
-    if sd is None:
-        print("⚠️ sounddevice is not installed.")
-        return
     try:
         devices = sd.query_devices()
         default_input, default_output = sd.default.device
@@ -185,8 +178,6 @@ def print_audio_devices():
 
 
 def resolve_audio_devices():
-    if sd is None:
-        return INPUT_DEVICE, OUTPUT_DEVICE
     try:
         default_input, default_output = sd.default.device
         input_device = INPUT_DEVICE if INPUT_DEVICE is not None else default_input
@@ -224,8 +215,6 @@ def downsample_audio(audio_data, source_rate, target_rate):
 
 
 def calibrate_microphone_sync(fs, channels):
-    if sd is None:
-        raise RuntimeError("sounddevice is not installed")
     print("🎚️ Calibrating microphone; please stay quiet...", flush=True)
     frame_count = max(1, int(fs * CALIBRATION_DURATION))
     recording = sd.rec(
@@ -329,8 +318,6 @@ def create_tts_audio(text, speed=TTS_SPEECH_SPEED):
     )
 
 def record_audio_sync(fs, channels):
-    if sd is None:
-        raise RuntimeError("sounddevice is not installed")
     block_size = int(fs * BLOCK_DURATION)
     recorded_frames = []
     start_time = time.perf_counter()
@@ -507,8 +494,6 @@ class ContinuousAudioPlayer:
         self.started = False
 
     def _ensure_stream(self, sample_rate, channels, dtype):
-        if sd is None:
-            raise RuntimeError("sounddevice is not installed")
         stream_format = (sample_rate, channels, dtype)
         if self.stream is not None and self.stream_format != stream_format:
             self.close()
@@ -549,8 +534,6 @@ class ContinuousAudioPlayer:
 
 
 def play_audio_sync(samples, sample_rate):
-    if sd is None:
-        raise RuntimeError("sounddevice is not installed")
     sd.play(samples, sample_rate, device=SELECTED_OUTPUT_DEVICE)
     sd.wait()
 
@@ -565,16 +548,15 @@ async def say_farewell(user_text=None):
         print(f"🗣️ You: {user_text}")
     print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {ACTIVE_FAREWELL_TEXT}")
 
-    if not TEXT_MODE_ONLY:
-        try:
-            samples, sample_rate = await asyncio.to_thread(
-                create_tts_audio,
-                ACTIVE_FAREWELL_TEXT,
-                TTS_SPEECH_SPEED,
-            )
-            await asyncio.to_thread(play_audio_sync, samples, sample_rate)
-        except Exception as e:
-            print(f"Farewell playback error: {e}")
+    try:
+        samples, sample_rate = await asyncio.to_thread(
+            create_tts_audio,
+            ACTIVE_FAREWELL_TEXT,
+            TTS_SPEECH_SPEED,
+        )
+        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+    except Exception as e:
+        print(f"Farewell playback error: {e}")
 
     print("\n👋 Assistant shut down cleanly.")
     shutdown_event.set()
@@ -891,13 +873,11 @@ async def audio_player_worker():
 async def main():
     global SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
     global MIC_START_THRESHOLD, MIC_STOP_THRESHOLD
-    if not TEXT_MODE_ONLY:
-        SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
+    SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
 
     print(f"\n🚀 Perfect English Chatbot Started ({TTS_ENGINE.title()} TTS & Google Gemini API).")
+    await asyncio.to_thread(load_tts_model)
     await warmup_llm()
-    if not TEXT_MODE_ONLY:
-        await asyncio.to_thread(load_tts_model)
 
     if TEXT_MODE_ONLY:
         print("⌨️ Text mode enabled. Type your message and press Enter.")
@@ -921,26 +901,26 @@ async def main():
         asyncio.create_task(vad_worker())
         asyncio.create_task(stt_worker(stt_model))
     asyncio.create_task(llm_worker())
-    if not TEXT_MODE_ONLY:
-        asyncio.create_task(tts_chunk_worker())
-        asyncio.create_task(tts_generator_worker())
-        asyncio.create_task(audio_player_worker())
+    asyncio.create_task(tts_chunk_worker())
+    asyncio.create_task(tts_generator_worker())
+    asyncio.create_task(audio_player_worker())
     
-    intro_text = ACTIVE_INTRO_TEXT
-    print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
-    if not TEXT_MODE_ONLY:
-        try:
-            samples, sample_rate = await asyncio.to_thread(
-                create_tts_audio,
-                intro_text,
-                TTS_SPEECH_SPEED,
-            )
-            await asyncio.to_thread(play_audio_sync, samples, sample_rate)
-        except Exception as e:
-            print(f"Intro playback error: {e}")
-
-    conversation_history.append({"role": "user", "parts": [{"text": "Hello! Are you ready?"}]})
-    conversation_history.append({"role": "model", "parts": [{"text": intro_text}]})
+    # Giriş cümlesini de yeni sisteme uygun güvenli şekilde hazırlıyoruz
+    try:
+        intro_text = ACTIVE_INTRO_TEXT
+        print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
+        
+        samples, sample_rate = await asyncio.to_thread(
+            create_tts_audio,
+            intro_text,
+            TTS_SPEECH_SPEED,
+        )
+        await asyncio.to_thread(play_audio_sync, samples, sample_rate)
+        
+        conversation_history.append({"role": "user", "parts": [{"text": "Hello! Are you ready?"}]})
+        conversation_history.append({"role": "model", "parts": [{"text": intro_text}]})
+    except Exception as e:
+        print(f"Intro playback error: {e}")
         
     can_listen_event.set()
     await shutdown_event.wait()
