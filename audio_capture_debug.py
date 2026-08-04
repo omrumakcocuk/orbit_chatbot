@@ -45,9 +45,23 @@ def downsample_audio(audio_data, source_rate, target_rate):
 
     duration = len(audio_data) / float(source_rate)
     target_length = max(1, int(duration * target_rate))
+    print(
+        "🔄 Downsampling audio:",
+        f"samples={len(audio_data)} @ {source_rate} Hz",
+        f"-> target_samples={target_length} @ {target_rate} Hz",
+    )
+    print(
+        f"   duration={duration:.3f}s, ratio={source_rate / float(target_rate):.2f}:1"
+    )
     source_positions = np.linspace(0, len(audio_data) - 1, num=len(audio_data), dtype=np.float32)
     target_positions = np.linspace(0, len(audio_data) - 1, num=target_length, dtype=np.float32)
-    return np.interp(target_positions, source_positions, audio_data).astype(np.float32)
+    downsampled = np.interp(target_positions, source_positions, audio_data).astype(np.float32)
+    print(
+        "✅ Downsampling complete:",
+        f"output_samples={len(downsampled)}",
+        f"output_duration={len(downsampled) / float(target_rate):.3f}s",
+    )
+    return downsampled
 
 
 def save_wav(path, audio_data, sample_rate):
@@ -108,6 +122,11 @@ def main():
         CHANNELS,
         RECORD_SECONDS,
         input_device,
+    )
+    print(
+        "📦 Captured mono audio:",
+        f"samples={len(mono_48k)}",
+        f"duration={len(mono_48k) / float(INPUT_SAMPLE_RATE):.3f}s",
     )
     mono_16k = downsample_audio(mono_48k, INPUT_SAMPLE_RATE, TARGET_SAMPLE_RATE)
 
