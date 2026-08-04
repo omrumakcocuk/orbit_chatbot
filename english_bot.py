@@ -45,7 +45,7 @@ WAIT_FOR_SPEECH_TIMEOUT = 10.0
 RECORDING_SAFETY_TIMEOUT = 60.0
 BLOCK_DURATION = 0.05
 MIN_SPEECH_DURATION = 0.15
-MIN_RECORDING_AFTER_SPEECH_START = 0.15
+MIN_RECORDING_AFTER_SPEECH_START = 0.20
 INPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_INPUT_DEVICE"))
 OUTPUT_DEVICE = _parse_device_index(os.environ.get("CHATBOT_OUTPUT_DEVICE"))
 SELECTED_INPUT_DEVICE = INPUT_DEVICE
@@ -62,7 +62,7 @@ GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
 GEMINI_MODEL_NAME = "gemini-3.1-flash-lite"
-WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "tiny.en")
+WHISPER_MODEL_SIZE = os.environ.get("WHISPER_MODEL_SIZE", "base.en")
 WHISPER_TRANSCRIBE_OPTIONS = {
     "beam_size": 1,
     "best_of": 1,
@@ -78,7 +78,7 @@ LLM_TEMPERATURE = 0.3
 MAX_HISTORY_MESSAGES = 4
 FIRST_TTS_WORDS = 5
 NEXT_TTS_WORDS = 10
-TTS_SPEECH_SPEED = 1.45
+TTS_SPEECH_SPEED = 1.3
 
 perf_metrics = {}
 conversation_history = []
