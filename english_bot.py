@@ -39,9 +39,10 @@ def _parse_device_index(value):
 TOTAL_LOGICAL_CORES = os.cpu_count() or 4
 WHISPER_THREADS = TOTAL_LOGICAL_CORES
 
-INPUT_SAMPLE_RATE = 48000
+INPUT_SAMPLE_RATE = 16000
 WHISPER_SAMPLE_RATE = 16000
 CHANNELS = 2
+MIC_GAIN = float(os.environ.get("MIC_GAIN", "25.0"))
 SPEECH_THRESHOLD = 400
 SPEECH_THRESHOLD_FACTOR = 1.55
 CALIBRATION_DURATION = 0.3
@@ -371,10 +372,9 @@ def record_audio_sync(fs, channels):
                 if audio_block.ndim == 1:
                     audio_block = audio_block[:, None]
 
-                channel_rms = np.sqrt(np.mean(np.square(audio_block), axis=0))
-                active_channel = int(np.argmax(channel_rms))
-                rms = float(channel_rms[active_channel])
-                mono_block = audio_block[:, active_channel]
+                mono_block = audio_block[:, 0]
+                mono_block = np.clip(mono_block * MIC_GAIN, -32768.0, 32767.0)
+                rms = float(np.sqrt(np.mean(np.square(mono_block))))
 
                 if not speech_started:
                     if rms > start_threshold:
