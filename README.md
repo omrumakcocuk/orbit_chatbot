@@ -2,7 +2,7 @@
 
 Orbit Chatbot, tamamen yerel (çevrimdışı) ve CPU/GPU üzerinde yüksek performansla çalışabilen, gerçek zamanlı ve düşük gecikmeli (low-latency) bir İngilizce konuşma ve pratik asistanı projesidir. Proje, ihtiyacınıza göre kullanabileceğiniz iki farklı asistan modunu barındırır:
 
-1. **Doğal ve Akıcı Sohbet Asistanı (`english_bot.py`):** Son teknoloji **Kokoro TTS (v1.0)** ses motorunu kullanır. Program her başlatıldığında Amerikan aksanlı **Adam** (Erkek) veya **Heart** (Kadın) karakterlerinden biriyle eşleşerek samimi, takılmasız ve gerçekçi bir İngilizce sohbet deneyimi yaşarsınız.
+1. **Doğal ve Akıcı Sohbet Asistanı (`english_bot.py`):** Raspberry Pi'de hızlı çalışması için varsayılan olarak **Piper TTS** kullanır. İstenirse mevcut Kokoro dosyalarıyla `TTS_ENGINE=kokoro` ayarlanarak **Kokoro TTS** motoruna geri dönülebilir.
 2. **Seviye Tabanlı İngilizce Eğitmeni (`main.py`):** Hafif ve hızlı **Piper TTS** kullanarak A1, A2, B1 ve B2 seviyelerinden birini seçmenize olanak tanır ve kelimeleri seviyenize göre adapte ederek size pratik yaptırır.
 
 Sistem; kullanıcının konuşmasını tam zamanında yakalamak ve sessizlik bittiği an yanıtlamak için **VAD** (Voice Activity Detection), yüksek doğrulukla sesi metne dökebilmek için **faster-whisper** ve akıl yürüten arka plan modeli olarak **Ollama (`gemma4:e2b`)** kullanır. Tamamen asenkron (async queue pipeline) ve akış (streaming) mantığında tasarlanmıştır; asistan cümleyi üretirken anında kelimeleri sentezleyip kesintisiz seslendirir.
@@ -42,17 +42,15 @@ ollama run gemma4:e2b
 ### 3. Ses Modellerini Yerleştirme (`voices/` klasörü)
 Projenizin ana dizinindeki `voices` klasörü içerisine kullanmak istediğiniz seniaryoya uygun model dosyalarını yerleştirin:
 
-#### A) Kokoro TTS Kurulumu (`english_bot.py` için - Önerilen Mod)
-Doğal konuşma pratik modu için aşağıda belirtilen model dosyalarını indirilip `voices/` içerisine bırakılmalıdır:
+#### A) Kokoro TTS Kurulumu (Opsiyonel)
+Kokoro modunu kullanmak için aşağıda belirtilen model dosyaları `voices/` içerisine bırakılmalıdır:
 - `kokoro-v1.0.onnx`
 - `voices-v1.0.bin`
 
-#### B) Piper TTS Kurulumu (`main.py` için - Eğitmen Modu)
-Seviye belirlemeli rehber öğretici modu kullanacaksanız:
-1. [Piper Releases](https://github.com/rhasspy/piper/releases) sayfasından işletim sisteminize uygun (örn: `piper_linux_x86_64`) paketi indirin ve içindeki `piper` dosyasını `venv/bin/` klasörüne kopyalayın.
-2. `voices/` içerisine Piper İngilizce modelini indirin:
-   - `en_US-lessac-medium.onnx`
-   - `en_US-lessac-medium.onnx.json`
+#### B) Piper TTS Kurulumu (Varsayılan)
+`pip install -r requirements.txt` komutu Piper Python paketini kurar. Aşağıdaki model ve JSON dosyalarını `voices/` içerisine indirin:
+- [Amy medium](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/amy/medium): `en_US-amy-medium.onnx` ve `en_US-amy-medium.onnx.json`
+- [Bryce medium](https://huggingface.co/rhasspy/piper-voices/tree/main/en/en_US/bryce/medium): `en_US-bryce-medium.onnx` ve `en_US-bryce-medium.onnx.json`
 
 ---
 
@@ -60,11 +58,17 @@ Seviye belirlemeli rehber öğretici modu kullanacaksanız:
 
 Kurulumlar tamamlandıktan sonra, sanal ortam (venv) aktifken istediğiniz asistan scriptini çalıştırabilirsiniz:
 
-### 1. Akıcı ve Doğal Sohbet (Kokoro TTS)
-Her başlatmada rastgele olarak **Adam** veya **Heart** sesli asistanlarından biri ile bağlandığınız, gündelik İngilizce pratik modudur:
+### 1. Akıcı ve Doğal Sohbet (Piper TTS)
+Her başlatmada rastgele olarak **Amy** veya **Bryce** sesli asistanlarından biri ile bağlandığınız, gündelik İngilizce pratik modudur:
 
 ```bash
 python english_bot.py
+```
+
+Kokoro motorunu kullanmak için:
+
+```bash
+TTS_ENGINE=kokoro python english_bot.py
 ```
 
 ### 2. Seviye Belirlemeli İngilizce Pratik Eğitmeni (Piper TTS)

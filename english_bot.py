@@ -15,6 +15,8 @@ from faster_whisper import WhisperModel
 from google import genai
 from google.genai import types
 from kokoro_onnx import Kokoro
+from piper import PiperVoice
+from piper.config import SynthesisConfig
 
 load_dotenv()
 warnings.filterwarnings("ignore")
@@ -51,8 +53,10 @@ SELECTED_OUTPUT_DEVICE = OUTPUT_DEVICE
 
 KOKORO_MODEL = "voices/kokoro-v1.0.onnx"
 KOKORO_VOICES = "voices/voices-v1.0.bin"
+TTS_ENGINE = os.environ.get("TTS_ENGINE", "piper").strip().lower()
 kokoro_tts = None
-kokoro_lock = None
+piper_tts = None
+tts_lock = None
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 gemini_client = None
 
@@ -88,16 +92,18 @@ EXIT_COMMANDS = {
 VOICE_OPTIONS = [
     {
         "id": "am_adam",
-        "name": "Adam",
+        "name": "Bryce",
+        "piper_model": "voices/en_US-bryce-medium.onnx",
+        "piper_config": "voices/en_US-bryce-medium.onnx.json",
         "intro": (
-            "Hello, I'm Adam. I'm ready. "
+            "Hello, I'm Bryce. I'm ready. "
             "What would you like to talk about today?"
         ),
         "farewell": (
             "Goodbye! It was great talking to you. Have a wonderful day!"
         ),
         "system_prompt": (
-            "You are Adam, a friendly, natural and confident American male "
+            "You are Bryce, a friendly, natural and confident American male "
             "English conversation partner. Always reply in English. "
             "Answer in one or two short, complete, conversational sentences. "
             "Never stop mid-sentence."
@@ -105,16 +111,18 @@ VOICE_OPTIONS = [
     },
     {
         "id": "af_heart",
-        "name": "Heart",
+        "name": "Amy",
+        "piper_model": "voices/en_US-amy-medium.onnx",
+        "piper_config": "voices/en_US-amy-medium.onnx.json",
         "intro": (
-            "Hi there, I'm Heart. I'm ready. "
+            "Hi there, I'm Amy. I'm ready. "
             "What would you like to talk about?"
         ),
         "farewell": (
             "Bye for now! I really enjoyed our chat. See you next time!"
         ),
         "system_prompt": (
-            "You are Heart, a warm, friendly and helpful American female "
+            "You are Amy, a warm, friendly and helpful American female "
             "English conversation partner. Always reply in English. "
             "Answer in one or two short, complete, conversational sentences. "
             "Never stop mid-sentence."
@@ -125,6 +133,8 @@ VOICE_OPTIONS = [
 selected_voice = random.choice(VOICE_OPTIONS)
 ACTIVE_VOICE_ID = selected_voice["id"]
 ACTIVE_VOICE_NAME = selected_voice["name"]
+ACTIVE_PIPER_MODEL = selected_voice["piper_model"]
+ACTIVE_PIPER_CONFIG = selected_voice["piper_config"]
 ACTIVE_INTRO_TEXT = selected_voice["intro"]
 ACTIVE_FAREWELL_TEXT = selected_voice.get("farewell", "Goodbye! Have a great day!")
 ACTIVE_SYSTEM_PROMPT = selected_voice["system_prompt"]
@@ -220,10 +230,47 @@ async def warmup_llm():
 
 
 def load_tts_model():
-    print("Loading Kokoro TTS model...")
-    model = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
-    print("✅ Kokoro TTS loaded.")
-    return model
+    global kokoro_tts, piper_tts
+
+    if TTS_ENGINE == "piper":
+        print(f"Loading Piper TTS model ({ACTIVE_VOICE_NAME})...")
+        piper_tts = PiperVoice.load(
+            ACTIVE_PIPER_MODEL,
+            config_path=ACTIVE_PIPER_CONFIG,
+        )
+        print(f"✅ Piper TTS loaded ({ACTIVE_VOICE_NAME}).")
+        return
+
+    if TTS_ENGINE == "kokoro":
+        print("Loading Kokoro TTS model...")
+        kokoro_tts = Kokoro(KOKORO_MODEL, KOKORO_VOICES)
+        print("✅ Kokoro TTS loaded.")
+        return
+
+    raise RuntimeError(f"Unsupported TTS_ENGINE: {TTS_ENGINE}. Use 'piper' or 'kokoro'.")
+
+
+def create_tts_audio(text, speed=1.20):
+    if TTS_ENGINE == "piper":
+        if piper_tts is None:
+            raise RuntimeError("Piper TTS is not loaded")
+
+        synthesis_config = SynthesisConfig(length_scale=1.0 / speed)
+        chunks = list(piper_tts.synthesize(text, synthesis_config))
+        if not chunks:
+            raise RuntimeError("Piper generated no audio")
+
+        samples = np.concatenate([chunk.audio_float_array for chunk in chunks])
+        return samples, chunks[0].sample_rate
+
+    if kokoro_tts is None:
+        raise RuntimeError("Kokoro TTS is not loaded")
+    return kokoro_tts.create(
+        text,
+        voice=ACTIVE_VOICE_ID,
+        speed=speed,
+        lang="en-us",
+    )
 
 def record_audio_sync(fs, channels):
     block_size = int(fs * BLOCK_DURATION)
@@ -482,11 +529,9 @@ async def say_farewell(user_text=None):
 
     try:
         samples, sample_rate = await asyncio.to_thread(
-            kokoro_tts.create,
+            create_tts_audio,
             ACTIVE_FAREWELL_TEXT,
-            voice=ACTIVE_VOICE_ID,
-            speed=1.15,
-            lang="en-us",
+            1.15,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
     except Exception as e:
@@ -707,21 +752,18 @@ async def tts_generator_worker():
             turn_id, sequence_id, sentence = item
 
             try:
-                if kokoro_tts:
-                    if perf_metrics["tts_first_start"] == 0.0:
-                        perf_metrics["tts_first_start"] = time.perf_counter()
-                    async with kokoro_lock:
-                        samples, sample_rate = await asyncio.to_thread(
-                            kokoro_tts.create, sentence, voice=ACTIVE_VOICE_ID, speed=1.20, lang="en-us"
-                        )
-                    if perf_metrics["tts_first_ready"] == 0.0:
-                        perf_metrics["tts_first_ready"] = time.perf_counter()
-                    await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
-                else:
-                    raise Exception("Kokoro TTS not loaded")
+                if perf_metrics["tts_first_start"] == 0.0:
+                    perf_metrics["tts_first_start"] = time.perf_counter()
+                async with tts_lock:
+                    samples, sample_rate = await asyncio.to_thread(
+                        create_tts_audio, sentence, 1.3
+                    )
+                if perf_metrics["tts_first_ready"] == 0.0:
+                    perf_metrics["tts_first_ready"] = time.perf_counter()
+                await audio_queue.put((turn_id, sequence_id, samples, sample_rate))
                 
             except Exception as e:
-                print(f"❌ Kokoro generation error: {e}")
+                print(f"❌ {TTS_ENGINE.title()} generation error: {e}")
                 
         playback_queue.task_done()
 
@@ -804,12 +846,12 @@ async def audio_player_worker():
         audio_queue.task_done()
 
 async def main():
-    global kokoro_tts, kokoro_lock, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
+    global tts_lock, SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE
     SELECTED_INPUT_DEVICE, SELECTED_OUTPUT_DEVICE = resolve_audio_devices()
-    kokoro_lock = asyncio.Lock()
+    tts_lock = asyncio.Lock()
 
-    print("\n🚀 Perfect English Chatbot Started (Kokoro TTS & Google Gemini API & Aplay).")
-    kokoro_tts = await asyncio.to_thread(load_tts_model)
+    print(f"\n🚀 Perfect English Chatbot Started ({TTS_ENGINE.title()} TTS & Google Gemini API).")
+    await asyncio.to_thread(load_tts_model)
     await warmup_llm()
 
     if TEXT_MODE_ONLY:
@@ -837,11 +879,9 @@ async def main():
         print(f"🤖 Assistant ({ACTIVE_VOICE_NAME}): {intro_text}")
         
         samples, sample_rate = await asyncio.to_thread(
-            kokoro_tts.create,
+            create_tts_audio,
             intro_text,
-            voice=ACTIVE_VOICE_ID,
-            speed=1.15,
-            lang="en-us",
+            1.15,
         )
         await asyncio.to_thread(play_audio_sync, samples, sample_rate)
         

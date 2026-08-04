@@ -3,4 +3,5 @@ sounddevice
 faster-whisper
 google-genai
 kokoro-onnx
+piper-tts
 python-dotenv
