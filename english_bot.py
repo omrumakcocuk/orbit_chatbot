@@ -368,7 +368,7 @@ def record_audio_sync(fs, channels):
                     print(f"⚠️ Audio read error: {e}", flush=True)
                     continue
 
-                mono_block = np.frombuffer(data, dtype=np.int16)[1::2].astype(np.float32)
+                mono_block = np.frombuffer(data, dtype=np.int16)[0::2].astype(np.float32)
                 mono_block = np.clip(mono_block * MIC_GAIN, -32768.0, 32767.0)
                 rms = float(np.sqrt(np.mean(np.square(mono_block))))
 
